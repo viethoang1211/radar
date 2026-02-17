@@ -124,6 +124,9 @@ func main() {
 	// Now initialize cluster connection and caches (browser will see progress via SSE)
 	app.InitializeCluster()
 
+	// Track opens and maybe prompt to star the repo on GitHub (non-blocking)
+	app.MaybePromptGitHubStar()
+
 	// Block forever (server is running in background)
 	select {}
 }
