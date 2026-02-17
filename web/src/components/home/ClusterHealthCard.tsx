@@ -10,18 +10,55 @@ import { clsx } from 'clsx'
 import { formatCPUMillicores, formatMemoryMiB } from '../../utils/format'
 import { useCapabilitiesContext } from '../../contexts/CapabilitiesContext'
 import { MCPSetupDialog } from './MCPSetupDialog'
+import { Tooltip } from '../ui/Tooltip'
 
 interface ClusterHealthCardProps {
   health: DashboardResponse['health']
   counts: DashboardResponse['resourceCounts']
   cluster: DashboardResponse['cluster']
   metrics: DashboardMetrics | null
+  metricsServerAvailable: boolean
   topCRDs?: DashboardCRDCount[] // Loaded lazily, may be undefined
   problems: DashboardProblem[]
   onNavigateToKind: (kind: string, group?: string) => void
   onNavigateToView: () => void
   onWarningEventsClick?: () => void
   onUnhealthyClick?: () => void
+}
+
+function getMetricsInstallHint(platform: string): string {
+  const p = platform.toLowerCase()
+  if (p.includes('minikube')) return 'minikube addons enable metrics-server'
+  if (p.includes('gke') || p.includes('aks')) return 'metrics-server is usually pre-installed on this platform — check if it was disabled or removed'
+  if (p.includes('eks')) return 'kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml'
+  return 'kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml'
+}
+
+function MetricsUnavailableHint({ platform, metricsServerAvailable }: { platform: string; metricsServerAvailable: boolean }) {
+  if (metricsServerAvailable) {
+    return <span className="text-xs text-theme-text-tertiary">Waiting for metrics data...</span>
+  }
+
+  const hint = getMetricsInstallHint(platform)
+  const isPreInstalled = platform.toLowerCase().includes('gke') || platform.toLowerCase().includes('aks')
+
+  return (
+    <Tooltip
+      content={
+        <div className="space-y-1">
+          <div className="font-medium">How to fix</div>
+          <div>{isPreInstalled ? hint : <>Install by running:<br /><code className="text-[10px] opacity-80">{hint}</code></>}</div>
+        </div>
+      }
+      position="bottom"
+      className="!whitespace-normal !max-w-sm"
+    >
+      <span className="flex items-center gap-1.5 text-xs text-theme-text-tertiary">
+        <Info className="w-3 h-3 shrink-0" />
+        <span>Requires <span className="text-theme-text-secondary">metrics-server</span> to display CPU & memory usage</span>
+      </span>
+    </Tooltip>
+  )
 }
 
 // Get platform display name and icon path
@@ -62,6 +99,7 @@ export function ClusterHealthCard({
   counts,
   cluster,
   metrics,
+  metricsServerAvailable,
   topCRDs: _topCRDs,
   problems,
   onNavigateToKind,
@@ -282,7 +320,7 @@ export function ClusterHealthCard({
                 </div>
               )}
               {!metrics?.cpu && !metrics?.memory && (
-                <span className="text-xs text-theme-text-tertiary">Metrics unavailable</span>
+                <MetricsUnavailableHint platform={cluster.platform} metricsServerAvailable={metricsServerAvailable} />
               )}
             </div>
 

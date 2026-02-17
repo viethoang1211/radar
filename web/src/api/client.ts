@@ -196,6 +196,7 @@ export interface DashboardResponse {
   trafficSummary: DashboardTrafficSummary | null
   helmReleases: DashboardHelmSummary
   metrics: DashboardMetrics | null
+  metricsServerAvailable: boolean
   certificateHealth: DashboardCertificateHealth | null
 }
 

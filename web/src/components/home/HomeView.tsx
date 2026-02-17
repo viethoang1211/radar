@@ -54,6 +54,7 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
           counts={data.resourceCounts}
           cluster={data.cluster}
           metrics={data.metrics}
+          metricsServerAvailable={data.metricsServerAvailable}
           topCRDs={crdsData?.topCRDs}
           problems={data.problems ?? []}
           onNavigateToKind={onNavigateToResourceKind}

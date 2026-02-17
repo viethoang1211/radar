@@ -23,17 +23,18 @@ import (
 
 // DashboardResponse is the aggregated response for the home dashboard
 type DashboardResponse struct {
-	Cluster           DashboardCluster            `json:"cluster"`
-	Health            DashboardHealth             `json:"health"`
-	Problems          []DashboardProblem          `json:"problems"`
-	ResourceCounts    DashboardResourceCounts     `json:"resourceCounts"`
-	RecentEvents      []DashboardEvent            `json:"recentEvents"`
-	RecentChanges     []DashboardChange           `json:"recentChanges"`
-	TopologySummary   DashboardTopologySummary    `json:"topologySummary"`
-	TrafficSummary    *DashboardTrafficSummary    `json:"trafficSummary"`
-	HelmReleases      DashboardHelmSummary        `json:"helmReleases"`
-	Metrics           *DashboardMetrics           `json:"metrics"`
-	CertificateHealth *DashboardCertificateHealth `json:"certificateHealth,omitempty"`
+	Cluster                DashboardCluster            `json:"cluster"`
+	Health                 DashboardHealth             `json:"health"`
+	Problems               []DashboardProblem          `json:"problems"`
+	ResourceCounts         DashboardResourceCounts     `json:"resourceCounts"`
+	RecentEvents           []DashboardEvent            `json:"recentEvents"`
+	RecentChanges          []DashboardChange           `json:"recentChanges"`
+	TopologySummary        DashboardTopologySummary    `json:"topologySummary"`
+	TrafficSummary         *DashboardTrafficSummary    `json:"trafficSummary"`
+	HelmReleases           DashboardHelmSummary        `json:"helmReleases"`
+	Metrics                *DashboardMetrics           `json:"metrics"`
+	MetricsServerAvailable bool                        `json:"metricsServerAvailable"`
+	CertificateHealth      *DashboardCertificateHealth `json:"certificateHealth,omitempty"`
 }
 
 // DashboardCRDsResponse is the response for CRD counts (loaded lazily)
@@ -244,6 +245,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// Cluster metrics (best-effort, nil if metrics-server unavailable)
 	resp.Metrics = s.getDashboardMetrics(r.Context())
+	resp.MetricsServerAvailable = resp.Metrics != nil
 
 	// Certificate health (nil if no TLS secrets)
 	resp.CertificateHealth = s.getDashboardCertificateHealth(namespace)
