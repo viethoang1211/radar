@@ -95,6 +95,7 @@ import {
   getRouteParents,
   getRouteHostnames,
   getRouteBackends,
+  getRouteRulesCount,
   getSealedSecretStatus,
   getSealedSecretKeyCount,
   getWorkflowTemplateCount,
@@ -124,6 +125,8 @@ import { GitRepositoryCell, OCIRepositoryCell, HelmRepositoryCell, Kustomization
 import { ArgoApplicationCell, ArgoApplicationSetCell, ArgoAppProjectCell } from './renderers/argo-cells'
 import { VulnerabilityReportCell, ConfigAuditReportCell, ExposedSecretReportCell, RbacAssessmentReportCell, ClusterComplianceReportCell, SbomReportCell } from './renderers/trivy-cells'
 import { CertificateCell, CertificateRequestCell, ClusterIssuerCell, IssuerCell, OrderCell, ChallengeCell } from './renderers/certmanager-cells'
+import { NodePoolCell, NodeClaimCell, EC2NodeClassCell } from './renderers/karpenter-cells'
+import { ScaledObjectCell, ScaledJobCell, TriggerAuthenticationCell, ClusterTriggerAuthenticationCell } from './renderers/keda-cells'
 import { usePinnedKinds } from '../../hooks/useFavorites'
 
 // Pod problem filter options (special multi-select, not a single column value)
@@ -465,6 +468,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'hostnames', label: 'Hostnames', width: 'w-48' },
     { key: 'parents', label: 'Gateways', width: 'w-36' },
     { key: 'backends', label: 'Backends', width: 'w-48', tooltip: 'Backend services receiving traffic' },
+    { key: 'rules', label: 'Rules', width: 'w-16', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-20' },
   ],
   gatewayclasses: [
@@ -474,6 +478,64 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-28' },
     { key: 'age', label: 'Age', width: 'w-20' },
   ],
+  nodepools: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'nodeClass', label: 'Node Class', width: 'w-36' },
+    { key: 'limits', label: 'Limits', width: 'w-36', tooltip: 'CPU and memory limits' },
+    { key: 'disruption', label: 'Disruption', width: 'w-40', hideOnMobile: true },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  nodeclaims: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'instanceType', label: 'Instance Type', width: 'w-32' },
+    { key: 'nodePool', label: 'Node Pool', width: 'w-32' },
+    { key: 'nodeName', label: 'Node', width: 'w-40', hideOnMobile: true },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  ec2nodeclasses: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'ami', label: 'AMI', width: 'w-36', tooltip: 'AMI selector alias or ID' },
+    { key: 'role', label: 'IAM Role', width: 'w-48' },
+    { key: 'volumeSize', label: 'Volume', width: 'w-24', tooltip: 'Root volume size' },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  scaledobjects: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'target', label: 'Target', width: 'w-48', tooltip: 'Scale target workload' },
+    { key: 'replicas', label: 'Replicas', width: 'w-28', tooltip: 'Min-Max replica range' },
+    { key: 'triggerTypes', label: 'Trigger Types', width: 'w-40' },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  scaledjobs: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'target', label: 'Job Target', width: 'w-48' },
+    { key: 'strategy', label: 'Strategy', width: 'w-28' },
+    { key: 'triggerTypes', label: 'Trigger Types', width: 'w-40' },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  triggerauthentications: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'secretTargetRef', label: 'Secret Refs', width: 'w-20' },
+    { key: 'env', label: 'Env Vars', width: 'w-20' },
+    { key: 'hashiCorpVault', label: 'Vault', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
+  clustertriggerauthentications: [
+    { key: 'name', label: 'Name' },
+    { key: 'secretTargetRef', label: 'Secret Refs', width: 'w-20' },
+    { key: 'env', label: 'Env Vars', width: 'w-20' },
+    { key: 'hashiCorpVault', label: 'Vault', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-20' },
+  ],
   grpcroutes: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
@@ -481,6 +543,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'hostnames', label: 'Hostnames', width: 'w-48' },
     { key: 'parents', label: 'Gateways', width: 'w-36' },
     { key: 'backends', label: 'Backends', width: 'w-48', tooltip: 'Backend services receiving traffic' },
+    { key: 'rules', label: 'Rules', width: 'w-16', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-20' },
   ],
   tcproutes: [
@@ -489,6 +552,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-28' },
     { key: 'parents', label: 'Gateways', width: 'w-36' },
     { key: 'backends', label: 'Backends', width: 'w-48', tooltip: 'Backend services receiving traffic' },
+    { key: 'rules', label: 'Rules', width: 'w-16', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-20' },
   ],
   tlsroutes: [
@@ -498,6 +562,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'hostnames', label: 'Hostnames', width: 'w-48', tooltip: 'SNI hostnames for TLS routing' },
     { key: 'parents', label: 'Gateways', width: 'w-36' },
     { key: 'backends', label: 'Backends', width: 'w-48', tooltip: 'Backend services receiving traffic' },
+    { key: 'rules', label: 'Rules', width: 'w-16', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-20' },
   ],
   sealedsecrets: [
@@ -754,8 +819,17 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   ],
 }
 
+// Normalize a kind name to its plural API form used in KNOWN_COLUMNS keys.
+// Handles CRD singular names from URLs: 'ScaledObject' → 'scaledobjects', 'NodePool' → 'nodepools'
+function normalizeKindToPlural(kind: string): string {
+  const lower = kind.toLowerCase()
+  if (KNOWN_COLUMNS[lower]) return lower
+  if (KNOWN_COLUMNS[lower + 's']) return lower + 's'
+  return lower
+}
+
 function getColumnsForKind(kind: string): Column[] {
-  return KNOWN_COLUMNS[kind.toLowerCase()] || DEFAULT_COLUMNS
+  return KNOWN_COLUMNS[normalizeKindToPlural(kind)] || DEFAULT_COLUMNS
 }
 
 // Get the default visible columns for a kind
@@ -773,7 +847,8 @@ interface ColumnSettings {
 
 function loadColumnSettings(kind: string): ColumnSettings | null {
   try {
-    const raw = localStorage.getItem(COLUMN_SETTINGS_PREFIX + kind)
+    const key = COLUMN_SETTINGS_PREFIX + normalizeKindToPlural(kind)
+    const raw = localStorage.getItem(key)
     if (raw) return JSON.parse(raw)
   } catch { /* ignore */ }
   return null
@@ -781,13 +856,15 @@ function loadColumnSettings(kind: string): ColumnSettings | null {
 
 function saveColumnSettings(kind: string, settings: ColumnSettings) {
   try {
-    localStorage.setItem(COLUMN_SETTINGS_PREFIX + kind, JSON.stringify(settings))
+    const key = COLUMN_SETTINGS_PREFIX + normalizeKindToPlural(kind)
+    localStorage.setItem(key, JSON.stringify(settings))
   } catch { /* ignore */ }
 }
 
 function clearColumnSettings(kind: string) {
   try {
-    localStorage.removeItem(COLUMN_SETTINGS_PREFIX + kind)
+    const key = COLUMN_SETTINGS_PREFIX + normalizeKindToPlural(kind)
+    localStorage.removeItem(key)
   } catch { /* ignore */ }
 }
 
@@ -926,8 +1003,20 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
   useEffect(() => {
     const saved = loadColumnSettings(selectedKind.name)
     if (saved) {
-      setVisibleColumns(new Set(saved.visible))
-      setColumnWidths(saved.widths || {})
+      // If saved columns are just the defaults but this kind has specialized columns,
+      // discard the stale save and use the specialized columns instead
+      const defaultKeys = DEFAULT_COLUMNS.map(c => c.key)
+      const isStaleDefaults = allColumns !== DEFAULT_COLUMNS &&
+        saved.visible.length === defaultKeys.length &&
+        saved.visible.every(v => defaultKeys.includes(v))
+      if (isStaleDefaults) {
+        clearColumnSettings(selectedKind.name)
+        setVisibleColumns(getDefaultVisibleColumns(allColumns))
+        setColumnWidths({})
+      } else {
+        setVisibleColumns(new Set(saved.visible))
+        setColumnWidths(saved.widths || {})
+      }
     } else {
       setVisibleColumns(getDefaultVisibleColumns(allColumns))
       setColumnWidths({})
@@ -1559,7 +1648,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
     // Apply column filters (generic)
     const activeColFilters = Object.entries(columnFilters).filter(([, v]) => v)
     if (activeColFilters.length > 0) {
-      const kindLower = selectedKind.name.toLowerCase()
+      const kindLower = normalizeKindToPlural(selectedKind.name)
       const beforeCount = result.length
       result = result.filter((r: any) =>
         activeColFilters.every(([col, val]) =>
@@ -1627,7 +1716,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       })
     } else {
       // Default sort by kind
-      const kindLower = selectedKind.name.toLowerCase()
+      const kindLower = normalizeKindToPlural(selectedKind.name)
 
       if (kindLower === 'pods') {
         // Completed pods at bottom
@@ -1848,7 +1937,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
   const filterOptions = useMemo(() => {
     if (!resources || resources.length === 0) return null
 
-    const kindLower = selectedKind.name.toLowerCase()
+    const kindLower = normalizeKindToPlural(selectedKind.name)
     const columns = KNOWN_COLUMNS[kindLower] || DEFAULT_COLUMNS
 
     // Auto-detect filterable columns
@@ -2629,8 +2718,8 @@ function CellContent({ resource, kind, column }: CellContentProps) {
     return <span className="text-sm text-theme-text-secondary">{formatAge(meta.creationTimestamp)}</span>
   }
 
-  // Kind-specific columns
-  const kindLower = kind.toLowerCase()
+  // Kind-specific columns (normalize CRD singular names like 'ScaledObject' → 'scaledobjects')
+  const kindLower = normalizeKindToPlural(kind)
   switch (kindLower) {
     case 'pods':
       return <PodCell resource={resource} column={column} />
@@ -2720,6 +2809,22 @@ function CellContent({ resource, kind, column }: CellContentProps) {
       return <FluxHelmReleaseCell resource={resource} column={column} />
     case 'alerts':
       return <FluxAlertCell resource={resource} column={column} />
+    // Karpenter
+    case 'nodepools':
+      return <NodePoolCell resource={resource} column={column} />
+    case 'nodeclaims':
+      return <NodeClaimCell resource={resource} column={column} />
+    case 'ec2nodeclasses':
+      return <EC2NodeClassCell resource={resource} column={column} />
+    // KEDA
+    case 'scaledobjects':
+      return <ScaledObjectCell resource={resource} column={column} />
+    case 'scaledjobs':
+      return <ScaledJobCell resource={resource} column={column} />
+    case 'triggerauthentications':
+      return <TriggerAuthenticationCell resource={resource} column={column} />
+    case 'clustertriggerauthentications':
+      return <ClusterTriggerAuthenticationCell resource={resource} column={column} />
     // ArgoCD GitOps resources
     case 'applications':
       return <ArgoApplicationCell resource={resource} column={column} />
@@ -3624,6 +3729,8 @@ function RouteCell({ resource, column }: { resource: any; column: string }) {
         </Tooltip>
       )
     }
+    case 'rules':
+      return <span className="text-sm text-theme-text-secondary">{getRouteRulesCount(resource)}</span>
     default:
       return <span className="text-sm text-theme-text-tertiary">-</span>
   }
