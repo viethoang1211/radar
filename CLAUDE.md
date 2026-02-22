@@ -440,6 +440,7 @@ GET  /api/ai/resources/{kind}/{ns}/{name}     # Minified single resource (verbos
   - `traffic`: Network flow (Ingress/Gateway → HTTPRoute → Service → Pod)
   - `resources`: Full hierarchy (Deployment → ReplicaSet → Pod)
 - Node types: Ingress, Gateway, HTTPRoute, GRPCRoute, TCPRoute, TLSRoute, Service, Deployment, DaemonSet, StatefulSet, ReplicaSet, Pod, Job, CronJob, ConfigMap, Secret, HorizontalPodAutoscaler, PersistentVolumeClaim, PersistentVolume, StorageClass, PodDisruptionBudget, VerticalPodAutoscaler
+- Edge type semantics (these drive UI grouping in Related Resources): `EdgeManages` (owner), `EdgeUses` (autoscalers like HPA/VPA/KEDA → Scalers group), `EdgeProtects` (PDB → Policies group), `EdgeConfigures` (ConfigMap/Secret), `EdgeExposes` (Service/Ingress/Gateway). Choose the right edge type — don't reuse one just because the code pattern is similar.
 - GitOps nodes: Application (ArgoCD), Kustomization, HelmRelease, GitRepository (FluxCD)
   - Connected to managed resources via status.resources (ArgoCD) or status.inventory (FluxCD Kustomization)
   - HelmRelease connects to resources via FluxCD labels (`helm.toolkit.fluxcd.io/name`) or standard Helm label (`app.kubernetes.io/instance`). Matches Deployment, Service, StatefulSet, DaemonSet, Job, CronJob, Rollout.
@@ -523,6 +524,12 @@ useMutation({
 ```
 
 Error responses are parsed as `{"error": "message"}` and displayed in toasts.
+
+### Resource Renderers
+- Sections with data should use `defaultExpanded` (true) — only collapse empty or low-priority sections
+- Register in: `renderers/index.ts` (export), `ResourceDetailDrawer.tsx` (import + knownKinds + render line)
+- Use `AlertBanner` for problem detection, `ConditionsSection` for K8s conditions
+- Long text in alerts/banners needs `break-all` class for CSS word breaking
 
 ## Tech Stack
 
