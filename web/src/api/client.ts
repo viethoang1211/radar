@@ -115,7 +115,6 @@ export interface DashboardResourceCounts {
   configMaps: number
   secrets: number
   pvcs: { total: number; bound: number; pending: number; unbound: number }
-  helmReleases: number
   restricted?: string[] // Resource kinds the user cannot list due to RBAC
 }
 
@@ -194,11 +193,11 @@ export interface DashboardResponse {
   recentChanges: DashboardChange[]
   topologySummary: DashboardTopologySummary
   trafficSummary: DashboardTrafficSummary | null
-  helmReleases: DashboardHelmSummary
   metrics: DashboardMetrics | null
   metricsServerAvailable: boolean
   certificateHealth: DashboardCertificateHealth | null
   nodeVersionSkew: { versions: Record<string, string[]>; minVersion: string; maxVersion: string } | null
+  deferredLoading?: boolean // True while deferred informers (secrets, events, etc.) are still syncing
 }
 
 export interface DashboardCRDsResponse {
@@ -240,6 +239,17 @@ export function useDashboardCRDs(namespaces: string[] = []) {
     queryFn: () => fetchJSON(`/dashboard/crds${params}`),
     staleTime: 30000, // 30 seconds - less frequent updates
     refetchInterval: 60000, // Refresh every minute
+  })
+}
+
+// Helm summary - loaded lazily after main dashboard (Helm SDK lists K8s secrets, ~2-3s)
+export function useDashboardHelm(namespaces: string[] = []) {
+  const params = namespaces.length > 0 ? `?namespaces=${namespaces.join(',')}` : ''
+  return useQuery<DashboardHelmSummary>({
+    queryKey: ['dashboard-helm', namespaces],
+    queryFn: () => fetchJSON(`/dashboard/helm${params}`),
+    staleTime: 30000,
+    refetchInterval: 60000,
   })
 }
 
@@ -1812,6 +1822,12 @@ export function useSwitchContext() {
       // Using removeQueries + invalidateQueries ensures no stale data is served
       queryClient.removeQueries()
       queryClient.invalidateQueries()
+    },
+    onError: () => {
+      // Invalidate contexts so the dropdown checkmark reflects the backend's
+      // current context after a failed switch (backend has already switched
+      // the in-memory context even though connectivity failed).
+      queryClient.invalidateQueries({ queryKey: ['contexts'] })
     },
   })
 }

@@ -26,6 +26,11 @@ type SSEBroadcaster struct {
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 
+	// watchStopCh is closed to stop the current watchResourceChanges goroutine.
+	// On context switch, it is replaced with a fresh channel to restart the watcher.
+	watchStopCh chan struct{}
+	watchMu     sync.Mutex
+
 	// Cached topology for relationship lookups (updated on each topology rebuild)
 	cachedTopology   *topology.Topology
 	cachedTopologyMu sync.RWMutex
@@ -64,10 +69,11 @@ func safeSend(ch chan SSEEvent, event SSEEvent) {
 // NewSSEBroadcaster creates a new SSE broadcaster
 func NewSSEBroadcaster() *SSEBroadcaster {
 	return &SSEBroadcaster{
-		clients:    make(map[chan SSEEvent]ClientInfo),
-		register:   make(chan clientRegistration),
-		unregister: make(chan chan SSEEvent),
-		stopCh:     make(chan struct{}),
+		clients:     make(map[chan SSEEvent]ClientInfo),
+		register:    make(chan clientRegistration),
+		unregister:  make(chan chan SSEEvent),
+		stopCh:      make(chan struct{}),
+		watchStopCh: make(chan struct{}),
 	}
 }
 
@@ -89,6 +95,7 @@ func (b *SSEBroadcaster) Start() {
 
 	go b.run()
 	go b.watchResourceChanges()
+	go b.watchDeferredSync()
 	go b.heartbeat()
 }
 
@@ -99,6 +106,54 @@ func (b *SSEBroadcaster) registerCRDDiscoveryCallback() {
 		log.Printf("SSE broadcaster: CRD discovery complete, broadcasting topology update")
 		b.broadcastTopologyUpdate()
 	})
+}
+
+// watchDeferredSync waits for deferred informers (secrets, events, etc.) to
+// finish syncing and then broadcasts a topology update + deferred_ready event
+// so the UI can fill in the missing data (config edges, event counts, etc.).
+// It captures a local copy of watchStopCh so it exits on context switch,
+// and is restarted alongside the resource watcher via restartResourceWatcher.
+func (b *SSEBroadcaster) watchDeferredSync() {
+	b.watchMu.Lock()
+	watchStop := b.watchStopCh
+	b.watchMu.Unlock()
+
+	// Wait for cache to exist first
+	for {
+		cache := k8s.GetResourceCache()
+		if cache != nil {
+			ch := cache.DeferredDone()
+			if ch == nil {
+				return // no deferred informers
+			}
+			select {
+			case <-ch:
+				// Verify cache is still current (not torn down by context switch)
+				if k8s.GetResourceCache() == nil {
+					return
+				}
+				log.Printf("SSE broadcaster: deferred informers synced, broadcasting topology update")
+				b.Broadcast(SSEEvent{
+					Event: "deferred_ready",
+					Data:  map[string]any{},
+				})
+				b.broadcastTopologyUpdate()
+				return
+			case <-b.stopCh:
+				return
+			case <-watchStop:
+				return
+			}
+		}
+		// Cache not ready yet — wait a bit and retry
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-b.stopCh:
+			return
+		case <-watchStop:
+			return
+		}
+	}
 }
 
 // registerConnectionStateCallback registers for connection state changes
@@ -149,6 +204,9 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 		b.cachedTopologyMu.Lock()
 		b.cachedTopology = nil
 		b.cachedTopologyMu.Unlock()
+
+		// Restart the resource change watcher for the new cache
+		b.restartResourceWatcher()
 
 		// Broadcast context_changed event to all clients
 		b.mu.RLock()
@@ -228,12 +286,74 @@ func (b *SSEBroadcaster) run() {
 	}
 }
 
-// watchResourceChanges listens for K8s resource changes and broadcasts topology updates
+// restartResourceWatcher stops the current watchResourceChanges and
+// watchDeferredSync goroutines and spawns new ones for the current
+// resource cache. Called on context switch since the old cache's
+// changes channel is abandoned (never closed — see cache.go Stop()).
+func (b *SSEBroadcaster) restartResourceWatcher() {
+	b.watchMu.Lock()
+	defer b.watchMu.Unlock()
+
+	close(b.watchStopCh)
+	b.watchStopCh = make(chan struct{})
+
+	go b.watchResourceChanges()
+	go b.watchDeferredSync()
+}
+
+// watchResourceChanges listens for K8s resource changes and broadcasts topology updates.
+// If the cache isn't ready yet (server starts before cluster init), it waits for
+// the connection state to become connected before starting the watch loop.
+// It captures a local copy of watchStopCh so that restartResourceWatcher() can
+// stop this goroutine by closing the old channel without a data race.
 func (b *SSEBroadcaster) watchResourceChanges() {
+	// Capture local stop channel — restartResourceWatcher() will close it
+	// when a context switch happens, causing this goroutine to exit.
+	b.watchMu.Lock()
+	watchStop := b.watchStopCh
+	b.watchMu.Unlock()
+
 	cache := k8s.GetResourceCache()
 	if cache == nil {
-		log.Println("Warning: Resource cache not available for SSE broadcasts")
-		return
+		// Cache not ready yet — wait for connection to be established
+		log.Println("SSE broadcaster: cache not ready, waiting for connection...")
+		ch := make(chan struct{}, 1)
+		k8s.OnConnectionChange(func(status k8s.ConnectionStatus) {
+			// Check if this watcher was replaced by a context switch.
+			// Without this, callbacks accumulate in the connectionCallbacks
+			// slice on each restart and fire uselessly on future state changes.
+			select {
+			case <-watchStop:
+				return
+			default:
+			}
+			if status.State == k8s.StateConnected {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+		})
+		// If already connected by the time we register, check again
+		if k8s.IsConnected() {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-ch:
+			cache = k8s.GetResourceCache()
+			if cache == nil {
+				log.Println("Warning: Resource cache still nil after connection")
+				return
+			}
+			log.Println("SSE broadcaster: cache ready, starting resource change watcher")
+		case <-b.stopCh:
+			return
+		case <-watchStop:
+			return
+		}
 	}
 
 	changes := cache.Changes()
@@ -249,6 +369,9 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 	for {
 		select {
 		case <-b.stopCh:
+			return
+
+		case <-watchStop:
 			return
 
 		case change, ok := <-changes:
@@ -296,6 +419,12 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 
 // broadcastTopologyUpdate sends the current topology to all clients
 func (b *SSEBroadcaster) broadcastTopologyUpdate() {
+	// Skip if resource cache is torn down (e.g. during context switch).
+	// The next successful connection will trigger a fresh build.
+	if k8s.GetResourceCache() == nil {
+		return
+	}
+
 	b.mu.RLock()
 	clients := make(map[chan SSEEvent]ClientInfo, len(b.clients))
 	maps.Copy(clients, b.clients)

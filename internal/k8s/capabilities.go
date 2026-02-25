@@ -14,8 +14,8 @@ import (
 // clusterScopedResources are K8s resources that exist at cluster scope (not namespaced).
 // These cannot be checked with a namespace-scoped SelfSubjectAccessReview.
 var clusterScopedResources = map[string]bool{
-	"nodes":            true,
-	"namespaces":       true,
+	"nodes":             true,
+	"namespaces":        true,
 	"persistentvolumes": true,
 	"storageclasses":    true,
 }
@@ -65,9 +65,9 @@ type Capabilities struct {
 }
 
 var (
-	cachedCapabilities *Capabilities
-	capabilitiesMu     sync.RWMutex
-	capabilitiesExpiry time.Time
+	cachedCapabilities   *Capabilities
+	capabilitiesMu       sync.RWMutex
+	capabilitiesExpiry   time.Time
 	capabilitiesTTL      = 60 * time.Second
 	capabilitiesErrorTTL = 5 * time.Second // Short TTL when API errors caused fail-closed results
 
@@ -87,15 +87,10 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 	}
 	capabilitiesMu.RUnlock()
 
-	// Need to refresh capabilities
-	capabilitiesMu.Lock()
-	defer capabilitiesMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if cachedCapabilities != nil && time.Now().Before(capabilitiesExpiry) {
-		caps := *cachedCapabilities
-		return &caps, nil
-	}
+	// Compute capabilities WITHOUT holding the write lock.
+	// Multiple concurrent callers may race, but redundant checks are harmless.
+	// Critical: holding the lock during network calls blocks
+	// InvalidateCapabilitiesCache() during context switch.
 
 	if GetClient() == nil {
 		// Return all false if client not initialized (fail closed)
@@ -103,10 +98,21 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 		return &Capabilities{Exec: false, Logs: false, PortForward: false, Secrets: false, SecretsUpdate: false, HelmWrite: false}, nil
 	}
 
-	// Use a background context so that HTTP request cancellation doesn't cause
-	// transient failures to be cached as "denied" for the full TTL.
-	checkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Don't start RBAC checks when disconnected — the exec credential plugin
+	// serializes all API calls per-process, so browser-polled capability checks
+	// would block retry/context-switch connectivity tests.
+	if GetConnectionStatus().State == StateDisconnected {
+		return &Capabilities{}, nil
+	}
+
+	// Use the operation context so RBAC checks are canceled on context switch.
+	// This prevents stale exec plugin calls from serializing and blocking the
+	// new context's connectivity test.
+	checkCtx, cancel := NewOperationContext(10 * time.Second)
 	defer cancel()
+
+	capStart := time.Now()
+	logTiming("   [caps] CheckCapabilities starting RBAC checks")
 
 	// Check each capability in parallel.
 	// Try cluster-wide first, then namespace-scoped as fallback for namespace-scoped users.
@@ -156,6 +162,7 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 	}
 
 	wg.Wait()
+	logTiming("   [caps] CheckCapabilities RBAC checks done (%v)", time.Since(capStart))
 
 	if ForceDisableHelmWrite {
 		caps.HelmWrite = false
@@ -168,8 +175,10 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 		ttl = capabilitiesErrorTTL
 		log.Printf("Warning: capability checks had API errors, using short cache TTL (%v)", ttl)
 	}
+	capabilitiesMu.Lock()
 	cachedCapabilities = caps
 	capabilitiesExpiry = time.Now().Add(ttl)
+	capabilitiesMu.Unlock()
 
 	return caps, nil
 }
@@ -179,6 +188,14 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 // Returns (allowed, apiErr) where apiErr=true means the API call itself failed
 // (distinct from RBAC denial where allowed=false, apiErr=false).
 func canI(ctx context.Context, namespace, group, resource, verb string) (allowed bool, apiErr bool) {
+	// Fast path: bail if context already canceled. This prevents queued
+	// goroutines from starting new (serialized) exec plugin invocations
+	// after the parent context is canceled.
+	if ctx.Err() != nil {
+		logTiming("   [caps] canI(%s %s) skipped: context canceled", verb, resource)
+		return false, true
+	}
+
 	k8sClient := GetClient()
 	if k8sClient == nil {
 		log.Printf("Warning: K8s client nil in canI check for %s %s", verb, resource)
@@ -198,7 +215,11 @@ func canI(ctx context.Context, namespace, group, resource, verb string) (allowed
 
 	result, err := k8sClient.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
 	if err != nil {
-		log.Printf("Warning: SelfSubjectAccessReview failed for %s %s: %v", verb, resource, err)
+		// Don't log warnings when the context was canceled (e.g., shutdown or
+		// failed connectivity check) — these aren't real RBAC failures.
+		if ctx.Err() == nil {
+			log.Printf("Warning: SelfSubjectAccessReview failed for %s %s: %v", verb, resource, err)
+		}
 		return false, true
 	}
 
@@ -213,11 +234,11 @@ func InvalidateCapabilitiesCache() {
 }
 
 var (
-	cachedPermResult    *PermissionCheckResult
-	resourcePermsMu     sync.RWMutex
-	resourcePermsExpiry time.Time
-	resourcePermsTTL         = 60 * time.Second
-	resourcePermsErrorTTL    = 5 * time.Second // Short TTL when API errors caused fail-closed results
+	cachedPermResult      *PermissionCheckResult
+	resourcePermsMu       sync.RWMutex
+	resourcePermsExpiry   time.Time
+	resourcePermsTTL      = 60 * time.Second
+	resourcePermsErrorTTL = 5 * time.Second // Short TTL when API errors caused fail-closed results
 )
 
 // CheckResourcePermissions checks RBAC permissions for all resource types using
@@ -241,18 +262,10 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 	}
 	resourcePermsMu.RUnlock()
 
-	resourcePermsMu.Lock()
-	defer resourcePermsMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if cachedPermResult != nil && time.Now().Before(resourcePermsExpiry) {
-		permsCopy := *cachedPermResult.Perms
-		return &PermissionCheckResult{
-			Perms:           &permsCopy,
-			NamespaceScoped: cachedPermResult.NamespaceScoped,
-			Namespace:       cachedPermResult.Namespace,
-		}
-	}
+	// Compute RBAC permissions WITHOUT holding the write lock.
+	// Multiple concurrent callers may race, but redundant checks are harmless.
+	// Critical: holding the lock during network calls blocks
+	// InvalidateResourcePermissionsCache() during context switch.
 
 	if GetClient() == nil {
 		log.Printf("Warning: K8s client not initialized, returning no resource permissions")
@@ -300,6 +313,8 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 	}
 
 	// Phase 1: Check all resources cluster-wide
+	logTiming("   [perms] Phase 1 starting: %d cluster-wide RBAC checks", len(checks))
+	phase1Start := time.Now()
 	var wg sync.WaitGroup
 	var hadErrors atomic.Bool
 	wg.Add(len(checks))
@@ -316,6 +331,19 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 	}
 
 	wg.Wait()
+	logTiming("    RBAC phase 1 (cluster-wide, %d checks): %v", len(checks), time.Since(phase1Start))
+
+	// Bail early if context was canceled (e.g., version check failed while
+	// RBAC checks were in-flight). No point starting Phase 2.
+	if ctx.Err() != nil {
+		logTiming("   [perms] Bailing after Phase 1: context canceled")
+		result := &PermissionCheckResult{Perms: perms}
+		resourcePermsMu.Lock()
+		cachedPermResult = result
+		resourcePermsExpiry = time.Now().Add(resourcePermsErrorTTL)
+		resourcePermsMu.Unlock()
+		return result
+	}
 
 	// Phase 2: If all namespace-scoped resources failed and we have a fallback namespace,
 	// retry those checks scoped to the specific namespace.
@@ -385,6 +413,7 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 		Namespace:       fallbackNs,
 	}
 
+	resourcePermsMu.Lock()
 	cachedPermResult = result
 	ttl := resourcePermsTTL
 	if hadErrors.Load() {
@@ -392,6 +421,7 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 		log.Printf("Warning: resource permission checks had API errors, using short cache TTL (%v)", ttl)
 	}
 	resourcePermsExpiry = time.Now().Add(ttl)
+	resourcePermsMu.Unlock()
 
 	return result
 }

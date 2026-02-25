@@ -127,6 +127,7 @@ func (s *Server) setupRoutes() {
 			r.Get("/version-check", s.handleVersionCheck)
 			r.Get("/dashboard", s.handleDashboard)
 			r.Get("/dashboard/crds", s.handleDashboardCRDs)
+			r.Get("/dashboard/helm", s.handleDashboardHelm)
 			r.Get("/cluster-info", s.handleClusterInfo)
 			r.Get("/capabilities", s.handleCapabilities)
 			r.Get("/topology", s.handleTopology)
@@ -336,9 +337,17 @@ func (s *Server) SetUpdater(u *updater.Updater) {
 	s.updater = u
 }
 
-// Stop gracefully stops the server
+// Handler returns the server's HTTP handler for use with httptest.
+func (s *Server) Handler() http.Handler {
+	return s.router
+}
+
+// Stop gracefully stops the server and releases the listening port.
 func (s *Server) Stop() {
 	s.broadcaster.Stop()
+	if s.listener != nil {
+		s.listener.Close()
+	}
 }
 
 // Handlers
