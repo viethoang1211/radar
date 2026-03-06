@@ -1,4 +1,4 @@
-name: Publish @skyhook/k8s-ui
+name: Publish @skyhook-io/k8s-ui
 
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://npm.pkg.github.com'
-          scope: '@skyhook'
+          scope: '@skyhook-io'
 
       - name: Publish
         run: npm publish

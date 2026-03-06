@@ -182,10 +182,10 @@ release_local() {
 release_k8s_ui() {
   echo ""
   echo -e "${BLUE}=========================================="
-  echo "  @skyhook/k8s-ui Release"
+  echo "  @skyhook-io/k8s-ui Release"
   echo -e "==========================================${NC}"
   echo ""
-  echo "This publishes @skyhook/k8s-ui to GitHub Packages."
+  echo "This publishes @skyhook-io/k8s-ui to GitHub Packages."
   echo "Tags use the prefix 'k8s-ui-' (e.g. k8s-ui-v0.1.0)."
   echo ""
 
@@ -240,10 +240,10 @@ release_k8s_ui() {
   git push origin "$K8S_UI_VERSION"
 
   echo ""
-  info "Tag pushed! GitHub Actions will publish @skyhook/k8s-ui to GitHub Packages."
+  info "Tag pushed! GitHub Actions will publish @skyhook-io/k8s-ui to GitHub Packages."
   echo ""
   echo "  Consumers can now run:"
-  echo "    npm install @skyhook/k8s-ui@${K8S_UI_VERSION#k8s-ui-v}"
+  echo "    npm install @skyhook-io/k8s-ui@${K8S_UI_VERSION#k8s-ui-v}"
   echo ""
   echo "  Watch progress: gh run watch"
   echo ""
@@ -329,7 +329,7 @@ main() {
   echo "What would you like to release?"
   echo "  1) Radar app      (v*.*.*)"
   echo "  2) pkg module     (pkg/v*.*.*)"
-  echo "  3) @skyhook/k8s-ui (k8s-ui-v*.*.*)"
+  echo "  3) @skyhook-io/k8s-ui (k8s-ui-v*.*.*)"
   echo ""
   read -p "Choice (1-3): " release_choice
   case $release_choice in
