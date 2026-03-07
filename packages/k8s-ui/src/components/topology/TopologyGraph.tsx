@@ -9,6 +9,7 @@ import {
   useReactFlow,
   useOnViewportChange,
   useNodes,
+  getViewportForBounds,
   type Node,
   type Edge,
   type NodeTypes,
@@ -17,8 +18,9 @@ import {
   MarkerType,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
+import { toCanvas } from 'html-to-image'
 
-import { AlertTriangle, RotateCw, Scissors, Shield } from 'lucide-react'
+import { AlertTriangle, Download, Loader2, RotateCw, Scissors, Shield } from 'lucide-react'
 import { useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
 
 import { K8sResourceNode } from './K8sResourceNode'
@@ -629,10 +631,77 @@ export function TopologyGraph({
         <Controls
           className="bg-theme-surface border border-theme-border rounded-lg"
           showInteractive={false}
-        />
+        >
+          <ExportPngButton />
+        </Controls>
         <ViewportController structureKey={structureKey} />
       </ReactFlow>
     </ReactFlowProvider>
+  )
+}
+
+// Export topology as PNG button (must be inside ReactFlowProvider)
+function ExportPngButton() {
+  const [exporting, setExporting] = useState(false)
+  const { getNodes, getNodesBounds } = useReactFlow()
+
+  const handleExport = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    e.preventDefault()
+
+    const flowEl = document.querySelector('.react-flow__viewport') as HTMLElement
+    if (!flowEl) return
+
+    const nodes = getNodes()
+    if (nodes.length === 0) return
+
+    setExporting(true)
+    try {
+      const bounds = getNodesBounds(nodes)
+      const padding = 100
+      const w = Math.ceil(bounds.width + padding * 2)
+      const h = Math.ceil(bounds.height + padding * 2)
+      const vp = getViewportForBounds(bounds, w, h, 0.5, 2, padding)
+
+      const canvas = await toCanvas(flowEl, {
+        backgroundColor: '#0f172a',
+        width: w,
+        height: h,
+        pixelRatio: 2,
+        skipFonts: true,
+        style: {
+          width: `${w}px`,
+          height: `${h}px`,
+          transform: `translate(${vp.x}px, ${vp.y}px) scale(${vp.zoom})`,
+        },
+      })
+
+      canvas.toBlob((blob) => {
+        if (!blob) return
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `topology-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.png`
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+      }, 'image/png')
+    } catch (err) {
+      console.error('Failed to export topology:', err)
+      alert('Failed to export: ' + (err instanceof Error ? err.message : String(err)))
+    } finally {
+      setExporting(false)
+    }
+  }, [getNodes, getNodesBounds])
+
+  return (
+    <button
+      className="react-flow__controls-button"
+      onClick={handleExport}
+      disabled={exporting}
+      title="Export as PNG"
+    >
+      {exporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+    </button>
   )
 }
 
