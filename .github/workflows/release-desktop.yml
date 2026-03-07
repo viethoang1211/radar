@@ -312,6 +312,24 @@ jobs:
           echo "=== Desktop checksums ==="
           cat checksums-desktop.txt
 
+      - name: Wait for GitHub Release to exist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          echo "Waiting for release ${TAG} to exist..."
+          for i in $(seq 1 30); do
+            if gh release view "${TAG}" --repo "${REPO}" &>/dev/null; then
+              echo "Release ${TAG} found after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "Attempt ${i}/30: release not found, waiting 30s..."
+            sleep 30
+          done
+          echo "::error::Release ${TAG} not found after 15 minutes"
+          exit 1
+
       - name: Upload to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
