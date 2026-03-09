@@ -43,6 +43,21 @@ func (b *Builder) Build(opts BuildOptions) (*Topology, error) {
 	// Detect large cluster and apply optimizations
 	isLargeCluster, hiddenKinds := b.detectLargeClusterAndOptimize(&opts)
 
+	// Large clusters without a namespace filter: skip the expensive build entirely.
+	// The frontend shows a "select namespace" prompt instead of a blank graph.
+	// ForRelationshipCache bypasses this guard — internal builds need the full graph
+	// for resource detail "Related Resources" lookups.
+	if isLargeCluster && len(opts.Namespaces) == 0 && !opts.ForRelationshipCache {
+		return &Topology{
+			Nodes:                   []Node{},
+			Edges:                   []Edge{},
+			Warnings:                []string{"Cluster too large for all-namespace topology. Filter to a specific namespace."},
+			LargeCluster:            true,
+			HiddenKinds:             hiddenKinds,
+			RequiresNamespaceFilter: true,
+		}, nil
+	}
+
 	var topo *Topology
 	var err error
 
@@ -4242,7 +4257,7 @@ func (b *Builder) buildResourcesTopology(opts BuildOptions) (*Topology, error) {
 		topo.CRDDiscoveryStatus = string(b.dynamic.GetDiscoveryStatus())
 	}
 
-	return truncateTopologyIfNeeded(topo, opts), nil
+	return topo, nil
 }
 
 // buildTrafficTopology creates a network-focused view
@@ -5528,7 +5543,7 @@ func (b *Builder) buildTrafficTopology(opts BuildOptions) (*Topology, error) {
 		topo.CRDDiscoveryStatus = string(b.dynamic.GetDiscoveryStatus())
 	}
 
-	return truncateTopologyIfNeeded(topo, opts), nil
+	return topo, nil
 }
 
 // Helper functions
@@ -5930,44 +5945,6 @@ func extractWorkloadReferencesFromMap(spec map[string]any) workloadRefs {
 	}
 
 	return refs
-}
-
-// truncateTopologyIfNeeded truncates the topology if it exceeds the max nodes limit
-// Returns the truncated topology with appropriate metadata set
-func truncateTopologyIfNeeded(topo *Topology, opts BuildOptions) *Topology {
-	if opts.MaxNodes <= 0 || len(topo.Nodes) <= opts.MaxNodes {
-		return topo
-	}
-
-	totalNodes := len(topo.Nodes)
-
-	// Keep only the first MaxNodes nodes
-	topo.Nodes = topo.Nodes[:opts.MaxNodes]
-	topo.Truncated = true
-	topo.TotalNodes = totalNodes
-
-	// Build a set of kept node IDs for fast lookup
-	keptNodeIDs := make(map[string]bool, len(topo.Nodes))
-	for _, node := range topo.Nodes {
-		keptNodeIDs[node.ID] = true
-	}
-
-	// Filter edges to only include those between kept nodes
-	filteredEdges := make([]Edge, 0, len(topo.Edges))
-	for _, edge := range topo.Edges {
-		if keptNodeIDs[edge.Source] && keptNodeIDs[edge.Target] {
-			filteredEdges = append(filteredEdges, edge)
-		}
-	}
-	topo.Edges = filteredEdges
-
-	// Add warning about truncation
-	topo.Warnings = append(topo.Warnings, fmt.Sprintf(
-		"Topology truncated: showing %d of %d nodes. Filter by namespace for better performance.",
-		opts.MaxNodes, totalNodes,
-	))
-
-	return topo
 }
 
 // getGatewayHealth derives Gateway health from status.conditions

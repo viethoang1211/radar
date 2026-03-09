@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"runtime"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,9 +29,51 @@ type ResourceCache struct {
 	deferredSynced   map[string]bool
 	deferredMu       sync.RWMutex
 	deferredDone     chan struct{}
+	deferredFailed   atomic.Bool // true if WaitForCacheSync failed for deferred informers
 	syncComplete     atomic.Bool
 	config           CacheConfig
 	stdlog           *log.Logger
+
+	// Per-informer sync tracking for diagnostics
+	informerStatuses []InformerSyncStatus
+	informerMu       sync.RWMutex
+	promotedKinds    []string // set when SyncTimeout fires; empty on normal sync
+	syncStartTime    time.Time
+}
+
+// InformerSyncStatus tracks the sync state of a single informer.
+type InformerSyncStatus struct {
+	Kind     string `json:"kind"`
+	Key      string `json:"key"`      // e.g. "pods", "deployments"
+	Deferred bool   `json:"deferred"` // true if deferred (non-critical)
+	Synced   bool   `json:"synced"`
+	SyncedAt string `json:"syncedAt,omitempty"` // RFC3339 timestamp
+	Items    int    `json:"items"`              // current item count in lister
+}
+
+// SyncPhase describes the current phase of cache initialization.
+type SyncPhase string
+
+const (
+	SyncPhaseNotStarted SyncPhase = "not_started"
+	SyncPhaseCritical   SyncPhase = "syncing_critical"
+	SyncPhaseDeferred   SyncPhase = "syncing_deferred"
+	SyncPhaseComplete   SyncPhase = "complete"
+)
+
+// CacheSyncStatus is the overall sync status exposed for diagnostics.
+type CacheSyncStatus struct {
+	Phase             SyncPhase            `json:"phase"`
+	SyncStarted       string               `json:"syncStarted,omitempty"` // RFC3339
+	ElapsedSec        float64              `json:"elapsedSec"`
+	CriticalTotal     int                  `json:"criticalTotal"`
+	CriticalSynced    int                  `json:"criticalSynced"`
+	DeferredTotal     int                  `json:"deferredTotal"`
+	DeferredSynced    int                  `json:"deferredSynced"`
+	Informers         []InformerSyncStatus `json:"informers"`
+	PendingCritical   []string             `json:"pendingCritical,omitempty"`   // kinds not yet synced
+	PendingDeferred   []string             `json:"pendingDeferred,omitempty"`
+	PromotedKinds     []string             `json:"promotedKinds,omitempty"`    // critical informers that timed out
 }
 
 type informerSetup struct {
@@ -38,8 +84,10 @@ type informerSetup struct {
 }
 
 // NewResourceCache creates and starts a ResourceCache from the given config.
-// It blocks until critical (non-deferred) informers have synced, then returns.
-// Deferred informers sync in the background.
+// Startup has three tiers:
+//   - Critical informers block until synced (or SyncTimeout, then promoted to deferred)
+//   - Deferred informers sync in the background after critical completes
+//   - Background informers (e.g. Events) sync independently on their own goroutine
 func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("CacheConfig.Client must not be nil")
@@ -79,6 +127,11 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		stdlog.Printf("Using namespace-scoped informers for namespace %q", cfg.Namespace)
 	}
 
+	// Factory serves as informer registry and shutdown coordinator.
+	// We don't call factory.Start() — informers are Run() individually
+	// to stagger critical vs deferred starts. Shutdown() still works
+	// because each informer's factory getter (e.g. factory.Core().V1().Pods().Informer())
+	// registers it internally when called in the setup loop below.
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		cfg.Client,
 		0, // no resync — updates come via watch
@@ -97,6 +150,8 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	var criticalSyncFuncs []cache.InformerSynced
 	var deferredSyncFuncs []cache.InformerSynced
 	var deferredKeys []string
+	var backgroundSyncFuncs []cache.InformerSynced // Events — sync independently, don't block deferredDone
+	var backgroundKeys []string
 	enabledCount := 0
 
 	rc := &ResourceCache{
@@ -107,6 +162,17 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		config:           cfg,
 		stdlog:           stdlog,
 	}
+
+	// Track per-informer sync status, HasSynced funcs, and the informer
+	// handle (needed for staggered start).
+	type informerEntry struct {
+		kind     string
+		key      string
+		deferred bool
+		synced   cache.InformerSynced
+		informer cache.SharedIndexInformer
+	}
+	var allEntries []informerEntry
 
 	for _, s := range setups {
 		if !enabled[s.key] {
@@ -126,13 +192,29 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			return nil, fmt.Errorf("failed to register %s event handler: %w", s.kind, err)
 		}
 
-		if deferredTypes[s.key] {
+		isDeferred := deferredTypes[s.key]
+		entry := informerEntry{kind: s.kind, key: s.key, deferred: isDeferred, synced: inf.HasSynced, informer: inf}
+		allEntries = append(allEntries, entry)
+
+		if isDeferred && s.isEvent {
+			// Events sync independently — they can take 60s+ on large clusters
+			// and shouldn't block topology completion or warmup transition.
+			backgroundSyncFuncs = append(backgroundSyncFuncs, inf.HasSynced)
+			backgroundKeys = append(backgroundKeys, s.key)
+		} else if isDeferred {
 			deferredSyncFuncs = append(deferredSyncFuncs, inf.HasSynced)
 			deferredKeys = append(deferredKeys, s.key)
 		} else {
 			criticalSyncFuncs = append(criticalSyncFuncs, inf.HasSynced)
 		}
 	}
+
+	// Initialize per-informer tracking
+	statuses := make([]InformerSyncStatus, len(allEntries))
+	for i, e := range allEntries {
+		statuses[i] = InformerSyncStatus{Kind: e.kind, Key: e.key, Deferred: e.deferred}
+	}
+	rc.informerStatuses = statuses
 
 	if enabledCount == 0 {
 		stdlog.Printf("Warning: No resource types are accessible (all RBAC checks failed)")
@@ -143,103 +225,257 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		return rc, nil
 	}
 
-	// Start all informers
-	factory.Start(stopCh)
+	// Start critical informers first. Deferred informers are started after
+	// Phase 1 completes to reduce concurrent LIST pressure on the API server.
+	// On large clusters (300+ nodes), ~10 concurrent LISTs is significantly
+	// lighter than ~19, giving the heaviest resource (Pods) more API server
+	// bandwidth during the critical path.
+	for _, e := range allEntries {
+		if !e.deferred {
+			go e.informer.Run(stopCh)
+		}
+	}
 
-	stdlog.Printf("Starting resource cache: %d critical + %d deferred informers (%d total)",
-		len(criticalSyncFuncs), len(deferredSyncFuncs), enabledCount)
+	if len(backgroundKeys) > 0 {
+		stdlog.Printf("Starting resource cache: %d critical + %d deferred + %d background informers (%d total)",
+			len(criticalSyncFuncs), len(deferredSyncFuncs), len(backgroundSyncFuncs), enabledCount)
+	} else {
+		stdlog.Printf("Starting resource cache: %d critical + %d deferred informers (%d total, deferred start after critical sync)",
+			len(criticalSyncFuncs), len(deferredSyncFuncs), enabledCount)
+	}
 	syncStart := time.Now()
+	rc.syncStartTime = syncStart
 
-	// Track per-informer sync times
-	for _, s := range setups {
-		if !enabled[s.key] {
-			continue
-		}
-		kind := s.kind
-		key := s.key
-		isDeferred := deferredTypes[key]
-		var fn cache.InformerSynced
-		if isDeferred {
-			for i, dk := range deferredKeys {
-				if dk == key {
-					fn = deferredSyncFuncs[i]
-					break
+	// Track per-informer sync completion in background goroutines.
+	// Each goroutine updates the InformerSyncStatus when its informer syncs.
+	for i, e := range allEntries {
+		idx := i
+		entry := e
+		go func() {
+			t := time.Now()
+			for !entry.synced() {
+				select {
+				case <-stopCh:
+					return
+				default:
 				}
+				time.Sleep(10 * time.Millisecond)
 			}
-		} else {
-			idx := 0
-			for _, ss := range setups {
-				if !enabled[ss.key] || deferredTypes[ss.key] {
-					continue
-				}
-				if ss.key == key {
-					fn = criticalSyncFuncs[idx]
-					break
-				}
-				idx++
-			}
-		}
-		if fn != nil {
 			tag := "critical"
-			if isDeferred {
+			if entry.deferred {
 				tag = "deferred"
 			}
-			go func() {
-				t := time.Now()
-				for !fn() {
-					select {
-					case <-stopCh:
-						return
-					default:
-					}
-					time.Sleep(10 * time.Millisecond)
+			logf("    Informer synced: %-28s %v (%s)", entry.kind, time.Since(t), tag)
+			rc.informerMu.Lock()
+			rc.informerStatuses[idx].Synced = true
+			rc.informerStatuses[idx].SyncedAt = time.Now().Format(time.RFC3339)
+			rc.informerMu.Unlock()
+		}()
+	}
+
+	// Phase 1: Wait for critical informers with periodic progress logging.
+	// Log every 5s so stuck syncs are visible in logs (previously silent).
+	timedOut := false
+	if len(criticalSyncFuncs) > 0 {
+		progressTicker := time.NewTicker(5 * time.Second)
+		defer progressTicker.Stop()
+
+		var deadlineCh <-chan time.Time
+		if cfg.SyncTimeout > 0 {
+			deadline := time.NewTimer(cfg.SyncTimeout)
+			defer deadline.Stop()
+			deadlineCh = deadline.C
+		}
+
+		for {
+			// Check if all critical informers are synced
+			allSynced := true
+			for _, fn := range criticalSyncFuncs {
+				if !fn() {
+					allSynced = false
+					break
 				}
-				logf("    Informer synced: %-28s %v (%s)", kind, time.Since(t), tag)
-			}()
+			}
+			if allSynced {
+				break
+			}
+
+			// Wait for either: stopCh, deadline, or next progress tick
+			select {
+			case <-stopCh:
+				return nil, fmt.Errorf("failed to sync critical resource caches")
+			case <-deadlineCh:
+				timedOut = true
+			case <-progressTicker.C:
+				// Log which informers are still pending, with item counts
+				counts := rc.GetKindObjectCounts()
+				rc.informerMu.RLock()
+				var synced, pendingParts []string
+				for _, s := range rc.informerStatuses {
+					if s.Deferred {
+						continue
+					}
+					if s.Synced {
+						synced = append(synced, s.Kind)
+					} else {
+						n := counts[s.Kind]
+						pendingParts = append(pendingParts, fmt.Sprintf("%s(%d)", s.Kind, n))
+					}
+				}
+				rc.informerMu.RUnlock()
+				stdlog.Printf("Critical sync progress: %d/%d synced (%.0fs elapsed) — pending: %s",
+					len(synced), len(synced)+len(pendingParts), time.Since(syncStart).Seconds(), strings.Join(pendingParts, ", "))
+			default:
+				time.Sleep(100 * time.Millisecond)
+			}
+			if timedOut {
+				break
+			}
 		}
 	}
 
-	// Phase 1: Wait for critical informers
-	if len(criticalSyncFuncs) > 0 {
-		if !cache.WaitForCacheSync(stopCh, criticalSyncFuncs...) {
-			close(stopCh)
-			return nil, fmt.Errorf("failed to sync critical resource caches")
+	if timedOut {
+		// Promote unsynced critical informers to deferred so they continue
+		// syncing in the background. The UI renders with partial data.
+		var promoted []string
+		rc.informerMu.Lock()
+		for i, e := range allEntries {
+			if e.deferred || e.synced() {
+				continue
+			}
+			promoted = append(promoted, e.kind)
+			// Add to deferred tracking (the informer is already running from Phase 1)
+			deferredSyncFuncs = append(deferredSyncFuncs, e.synced)
+			deferredKeys = append(deferredKeys, e.key)
+			// Mark as deferred in diagnostics
+			rc.informerStatuses[i].Deferred = true
 		}
+		rc.informerMu.Unlock()
+		stdlog.Printf("WARNING: Critical sync timed out after %v — promoting %d informers to deferred: %s",
+			cfg.SyncTimeout, len(promoted), strings.Join(promoted, ", "))
+		stdlog.Printf("UI will render with partial data; promoted informers continue syncing in background")
+		logf("    Phase 1 sync TIMED OUT (%d critical, %d promoted to deferred): %v",
+			len(criticalSyncFuncs), len(promoted), time.Since(syncStart))
+		rc.promotedKinds = promoted
+	} else {
+		logf("    Phase 1 sync (%d critical informers): %v", len(criticalSyncFuncs), time.Since(syncStart))
+		stdlog.Printf("Critical resource caches synced in %v — UI can render", time.Since(syncStart))
 	}
-	logf("    Phase 1 sync (%d critical informers): %v", len(criticalSyncFuncs), time.Since(syncStart))
-	stdlog.Printf("Critical resource caches synced in %v — UI can render", time.Since(syncStart))
+
+	// Log per-type resource counts for startup diagnostics
+	if counts := rc.GetKindObjectCounts(); len(counts) > 0 {
+		total := 0
+		var parts []string
+		for kind, count := range counts {
+			if count > 0 {
+				parts = append(parts, fmt.Sprintf("%s:%d", kind, count))
+				total += count
+			}
+		}
+		sort.Strings(parts)
+		stdlog.Printf("Resource breakdown (%d total): %s", total, strings.Join(parts, ", "))
+	}
 
 	rc.syncComplete.Store(true)
 
-	// Build deferred tracking state
-	deferredSynced := make(map[string]bool, len(deferredKeys))
-	for _, k := range deferredKeys {
+	// Build deferred tracking state (includes both deferred and background keys)
+	allDeferredKeys := append(append([]string{}, deferredKeys...), backgroundKeys...)
+	deferredSynced := make(map[string]bool, len(allDeferredKeys))
+	for _, k := range allDeferredKeys {
 		deferredSynced[k] = false
 	}
 	deferredDone := make(chan struct{})
 	rc.deferredSynced = deferredSynced
 	rc.deferredDone = deferredDone
 
-	// Phase 2: Wait for deferred informers in background
+	// Phase 2: Start deferred informers now that critical sync is done,
+	// then wait for them in background. This staggers the API server load.
+	for _, e := range allEntries {
+		if e.deferred {
+			go e.informer.Run(stopCh)
+		}
+	}
+
 	if len(deferredSyncFuncs) > 0 {
 		go func() {
 			deferredStart := time.Now()
-			if cache.WaitForCacheSync(stopCh, deferredSyncFuncs...) {
-				rc.deferredMu.Lock()
-				for _, k := range deferredKeys {
-					rc.deferredSynced[k] = true
+			progressTicker := time.NewTicker(5 * time.Second)
+			defer progressTicker.Stop()
+
+			for {
+				allSynced := true
+				for _, fn := range deferredSyncFuncs {
+					if !fn() {
+						allSynced = false
+						break
+					}
 				}
-				rc.deferredMu.Unlock()
-				close(deferredDone)
-				logf("    Phase 2 sync (%d deferred informers): %v", len(deferredSyncFuncs), time.Since(deferredStart))
-				stdlog.Printf("Deferred resource caches synced in %v (total: %v)", time.Since(deferredStart), time.Since(syncStart))
-			} else {
-				stdlog.Printf("ERROR: Deferred resource cache sync failed after %v", time.Since(deferredStart))
-				close(deferredDone)
+				if allSynced {
+					break
+				}
+
+				select {
+				case <-stopCh:
+					rc.deferredFailed.Store(true)
+					stdlog.Printf("ERROR: Deferred resource cache sync failed after %v", time.Since(deferredStart))
+					close(deferredDone)
+					return
+				case <-progressTicker.C:
+					counts := rc.GetKindObjectCounts()
+					rc.informerMu.RLock()
+					var synced, pendingParts []string
+					for _, s := range rc.informerStatuses {
+						if !s.Deferred {
+							continue
+						}
+						// Skip background informers (Events) in deferred progress
+						if slices.Contains(backgroundKeys, s.Key) {
+							continue
+						}
+						if s.Synced {
+							synced = append(synced, s.Kind)
+						} else {
+							n := counts[s.Kind]
+							pendingParts = append(pendingParts, fmt.Sprintf("%s(%d)", s.Kind, n))
+						}
+					}
+					rc.informerMu.RUnlock()
+					stdlog.Printf("Deferred sync progress: %d/%d synced (%.0fs elapsed) — pending: %s",
+						len(synced), len(synced)+len(pendingParts), time.Since(deferredStart).Seconds(), strings.Join(pendingParts, ", "))
+				default:
+					time.Sleep(100 * time.Millisecond)
+				}
 			}
+
+			rc.deferredMu.Lock()
+			for _, k := range deferredKeys {
+				rc.deferredSynced[k] = true
+			}
+			rc.deferredMu.Unlock()
+			close(deferredDone)
+			logf("    Phase 2 sync (%d deferred informers): %v", len(deferredSyncFuncs), time.Since(deferredStart))
+			stdlog.Printf("Deferred resource caches synced in %v (total: %v)", time.Since(deferredStart), time.Since(syncStart))
 		}()
 	} else {
 		close(deferredDone)
+	}
+
+	// Background informers (Events) sync independently — they can take 60s+
+	// on large clusters and shouldn't block topology/warmup completion.
+	if len(backgroundSyncFuncs) > 0 {
+		go func() {
+			bgStart := time.Now()
+			if cache.WaitForCacheSync(stopCh, backgroundSyncFuncs...) {
+				rc.deferredMu.Lock()
+				for _, k := range backgroundKeys {
+					rc.deferredSynced[k] = true
+				}
+				rc.deferredMu.Unlock()
+				stdlog.Printf("Background Events sync complete in %v", time.Since(bgStart))
+			} else {
+				stdlog.Printf("WARNING: Background Events sync failed after %v", time.Since(bgStart))
+			}
+		}()
 	}
 
 	return rc, nil
@@ -433,7 +669,9 @@ func (rc *ResourceCache) enqueueEvent(ch chan<- ResourceChange, obj any, op stri
 func (rc *ResourceCache) safeCallback(name string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			rc.stdlog.Printf("ERROR: k8score %s callback panicked: %v", name, r)
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			rc.stdlog.Printf("ERROR: k8score %s callback panicked: %v\n%s", name, r, buf[:n])
 		}
 	}()
 	fn()
@@ -479,6 +717,15 @@ func (rc *ResourceCache) ChangesRaw() chan ResourceChange {
 	return rc.changes
 }
 
+// PromotedKinds returns the list of resource kinds that were promoted from
+// critical to deferred due to SyncTimeout. Empty if sync completed normally.
+func (rc *ResourceCache) PromotedKinds() []string {
+	if rc == nil {
+		return nil
+	}
+	return rc.promotedKinds
+}
+
 // IsSyncComplete returns true after the initial critical informer sync.
 func (rc *ResourceCache) IsSyncComplete() bool {
 	if rc == nil {
@@ -487,26 +734,98 @@ func (rc *ResourceCache) IsSyncComplete() bool {
 	return rc.syncComplete.Load()
 }
 
-// IsDeferredSynced returns true when all deferred informers have completed sync.
+// IsDeferredSynced returns true when all deferred (non-background) informers have
+// completed sync. Background informers (e.g. Events) sync independently and are
+// not included. Returns false if still syncing or if sync failed.
 func (rc *ResourceCache) IsDeferredSynced() bool {
 	if rc == nil {
 		return false
 	}
 	select {
 	case <-rc.deferredDone:
-		return true
+		return !rc.deferredFailed.Load()
 	default:
 		return false
 	}
 }
 
-// DeferredDone returns a channel that is closed when all deferred informers
-// have completed their initial sync.
+// DeferredDone returns a channel that is closed when all deferred (non-background)
+// informers have completed their initial sync. Background informers sync independently.
 func (rc *ResourceCache) DeferredDone() <-chan struct{} {
 	if rc == nil {
 		return nil
 	}
 	return rc.deferredDone
+}
+
+// GetSyncStatus returns the current sync status of all informers for diagnostics.
+// Safe to call at any time, including during sync.
+func (rc *ResourceCache) GetSyncStatus() CacheSyncStatus {
+	if rc == nil {
+		return CacheSyncStatus{Phase: SyncPhaseNotStarted}
+	}
+
+	rc.informerMu.RLock()
+	statuses := make([]InformerSyncStatus, len(rc.informerStatuses))
+	copy(statuses, rc.informerStatuses)
+	rc.informerMu.RUnlock()
+
+	// Enrich with live item counts from listers
+	counts := rc.GetKindObjectCounts()
+	for i := range statuses {
+		if n, ok := counts[statuses[i].Kind]; ok {
+			statuses[i].Items = n
+		}
+	}
+
+	var critTotal, critSynced, defTotal, defSynced int
+	var pendingCritical, pendingDeferred []string
+	for _, s := range statuses {
+		if s.Deferred {
+			defTotal++
+			if s.Synced {
+				defSynced++
+			} else {
+				pendingDeferred = append(pendingDeferred, s.Kind)
+			}
+		} else {
+			critTotal++
+			if s.Synced {
+				critSynced++
+			} else {
+				pendingCritical = append(pendingCritical, s.Kind)
+			}
+		}
+	}
+
+	var phase SyncPhase
+	switch {
+	case rc.syncStartTime.IsZero():
+		phase = SyncPhaseNotStarted
+	case !rc.syncComplete.Load():
+		phase = SyncPhaseCritical
+	case !rc.IsDeferredSynced():
+		phase = SyncPhaseDeferred
+	default:
+		phase = SyncPhaseComplete
+	}
+
+	result := CacheSyncStatus{
+		Phase:           phase,
+		ElapsedSec:      time.Since(rc.syncStartTime).Seconds(),
+		CriticalTotal:   critTotal,
+		CriticalSynced:  critSynced,
+		DeferredTotal:   defTotal,
+		DeferredSynced:  defSynced,
+		Informers:       statuses,
+		PendingCritical: pendingCritical,
+		PendingDeferred: pendingDeferred,
+		PromotedKinds:   rc.promotedKinds,
+	}
+	if !rc.syncStartTime.IsZero() {
+		result.SyncStarted = rc.syncStartTime.Format(time.RFC3339)
+	}
+	return result
 }
 
 // GetEnabledResources returns a copy of the enabled resources map.

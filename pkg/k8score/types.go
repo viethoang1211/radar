@@ -10,6 +10,7 @@ package k8score
 
 import (
 	"log"
+	"time"
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -117,8 +118,9 @@ type CacheConfig struct {
 	// old and new objects. Returns nil if no meaningful changes. May be nil.
 	ComputeDiff func(kind string, oldObj, newObj any) *DiffInfo
 
-	// IsNoisyResource returns true if this resource change should skip the
-	// OnChange callback (but still be sent to the changes channel for SSE).
+	// IsNoisyResource returns true if this resource change should skip both the
+	// OnChange callback and the changes channel. Noisy resources are silently
+	// dropped to reduce pressure on the event pipeline.
 	// May be nil (nothing is treated as noisy).
 	IsNoisyResource func(kind, name, op string) bool
 
@@ -136,6 +138,12 @@ type CacheConfig struct {
 	// In Radar mode this is false (Radar's callback decides per-add).
 	// In connector mode this is true.
 	SuppressInitialAdds bool
+
+	// SyncTimeout is the maximum time to wait for critical informers to sync
+	// before proceeding with partial data. Unsynced critical informers are
+	// promoted to deferred and continue syncing in the background.
+	// Zero means wait indefinitely (original behavior).
+	SyncTimeout time.Duration
 
 	// DebugEvents enables verbose event debug logging.
 	DebugEvents bool

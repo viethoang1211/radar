@@ -141,11 +141,10 @@ type Topology struct {
 	Nodes              []Node   `json:"nodes"`
 	Edges              []Edge   `json:"edges"`
 	Warnings           []string `json:"warnings,omitempty"`           // Warnings about resources that failed to load
-	Truncated          bool     `json:"truncated,omitempty"`          // True if topology was truncated due to size limit
-	TotalNodes         int      `json:"totalNodes,omitempty"`         // Total nodes before truncation (only set if truncated)
-	LargeCluster       bool     `json:"largeCluster,omitempty"`       // True if cluster exceeds large cluster threshold
-	HiddenKinds        []string `json:"hiddenKinds,omitempty"`        // Resource kinds auto-hidden for performance
-	CRDDiscoveryStatus string   `json:"crdDiscoveryStatus,omitempty"` // CRD discovery status: idle, discovering, ready
+	LargeCluster            bool     `json:"largeCluster,omitempty"`            // True if cluster exceeds large cluster threshold
+	HiddenKinds             []string `json:"hiddenKinds,omitempty"`             // Resource kinds auto-hidden for performance
+	RequiresNamespaceFilter bool     `json:"requiresNamespaceFilter,omitempty"` // True if cluster is too large for all-namespace topology
+	CRDDiscoveryStatus      string   `json:"crdDiscoveryStatus,omitempty"`      // CRD discovery status: idle, discovering, ready
 }
 
 // ViewMode determines how the topology is built
@@ -164,12 +163,12 @@ type BuildOptions struct {
 	Namespaces         []string // Filter to specific namespaces (empty = all)
 	ViewMode           ViewMode // How to display topology
 	MaxIndividualPods  int      // Above this, pods are grouped (default: 5)
-	MaxNodes           int      // Maximum nodes to return (0 = unlimited, default: 500)
 	IncludeSecrets     bool     // Include Secret nodes
 	IncludeConfigMaps  bool     // Include ConfigMap nodes
 	IncludePVCs        bool     // Include PersistentVolumeClaim nodes
 	IncludeReplicaSets bool     // Include ReplicaSet nodes (noisy intermediate objects)
-	IncludeGenericCRDs bool     // Include CRDs with owner refs to topology nodes (default: true)
+	IncludeGenericCRDs     bool // Include CRDs with owner refs to topology nodes (default: true)
+	ForRelationshipCache   bool // Skip large cluster guard — used for internal relationship cache builds
 }
 
 // MatchesNamespace returns true if ns is in the allowed list, or if the list is empty (all allowed).
@@ -203,7 +202,6 @@ func DefaultBuildOptions() BuildOptions {
 		Namespaces:         nil, // Empty = all namespaces
 		ViewMode:           ViewModeResources,
 		MaxIndividualPods:  5,
-		MaxNodes:           2000,  // Limit to prevent browser crashes on large clusters
 		IncludeSecrets:     false, // Secrets are sensitive
 		IncludeConfigMaps:  true,
 		IncludePVCs:        true,
