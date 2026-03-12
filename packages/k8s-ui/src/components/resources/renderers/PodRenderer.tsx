@@ -160,16 +160,24 @@ function SecretValueCell({ value }: { value: string }) {
   )
 }
 
-function EnvRow({ name, value, isSecret }: { name: string; value: string; isSecret: boolean }) {
+function EnvRowShell({ name, children }: { name: string; children: ReactNode }) {
   return (
     <div className="flex items-start gap-1 text-xs font-mono py-0.5 border-b border-theme-border/30 last:border-0">
       <span className="text-theme-text-secondary shrink-0 break-all">{name}</span>
       <span className="text-theme-text-tertiary shrink-0">=</span>
+      {children}
+    </div>
+  )
+}
+
+function EnvRow({ name, value, isSecret }: { name: string; value: string; isSecret: boolean }) {
+  return (
+    <EnvRowShell name={name}>
       {isSecret
         ? <SecretValueCell value={value} />
         : <span className="text-theme-text-primary break-all min-w-0">{value}</span>
       }
-    </div>
+    </EnvRowShell>
   )
 }
 
@@ -193,11 +201,9 @@ function resolveEnvValueNode(env: any): JSX.Element {
 
 function EnvVarRow({ env }: { env: any }) {
   return (
-    <div className="flex items-start gap-1 text-xs font-mono py-0.5 border-b border-theme-border/30 last:border-0">
-      <span className="text-theme-text-secondary shrink-0 break-all">{env.name}</span>
-      <span className="text-theme-text-tertiary shrink-0">=</span>
+    <EnvRowShell name={env.name}>
       {resolveEnvValueNode(env)}
-    </div>
+    </EnvRowShell>
   )
 }
 
