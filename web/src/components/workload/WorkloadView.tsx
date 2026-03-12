@@ -1,4 +1,5 @@
 import { useMemo, useEffect, useCallback } from 'react'
+import { useQueries } from '@tanstack/react-query'
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom'
 import { clsx } from 'clsx'
 import { Terminal } from 'lucide-react'
@@ -6,7 +7,7 @@ import {
   WorkloadView as BaseWorkloadView,
   type RendererOverrides,
 } from '@skyhook-io/k8s-ui'
-import type { SelectedResource, ResourceRef } from '../../types'
+import type { SelectedResource, ResourceRef, ResolvedEnvFrom } from '../../types'
 import type { NavigateToResource } from '../../utils/navigation'
 import {
   useChanges, useResourceWithRelationships, usePodLogs, useTopology, useUpdateResource,
@@ -14,6 +15,7 @@ import {
   useRestartWorkload, useWorkloadRevisions, useRollbackWorkload,
   useFluxReconcile, useFluxSyncWithSource, useFluxSuspend, useFluxResume,
   useArgoSync, useArgoRefresh, useArgoSuspend, useArgoResume,
+  fetchJSON,
 } from '../../api/client'
 import { PrometheusCharts, isPrometheusSupported } from '../resource/PrometheusCharts'
 import { WorkloadLogsViewer } from '../logs/WorkloadLogsViewer'
@@ -208,6 +210,61 @@ export function WorkloadView({
   const relationships = resourceResponse?.relationships
   const certificateInfo = resourceResponse?.certificateInfo
 
+  // For pods: extract envFrom ConfigMap/Secret names and resolve their keys
+  const isPod = kindProp.toLowerCase() === 'pods'
+  const { envFromConfigMapNames, envFromSecretNames } = useMemo(() => {
+    if (!isPod || !resource) return { envFromConfigMapNames: [] as string[], envFromSecretNames: [] as string[] }
+    const cmNames = new Set<string>()
+    const secretNames = new Set<string>()
+    const containers = [...(resource.spec?.containers || []), ...(resource.spec?.initContainers || [])]
+    for (const c of containers) {
+      for (const ef of (c.envFrom || [])) {
+        if (ef.configMapRef?.name) cmNames.add(ef.configMapRef.name)
+        if (ef.secretRef?.name) secretNames.add(ef.secretRef.name)
+      }
+    }
+    return { envFromConfigMapNames: Array.from(cmNames), envFromSecretNames: Array.from(secretNames) }
+  }, [isPod, resource])
+
+  const configMapQueries = useQueries({
+    queries: envFromConfigMapNames.map((cmName) => ({
+      queryKey: ['resources', 'configmaps', namespace, cmName],
+      queryFn: () => fetchJSON<any>(`/resources/configmaps/${namespace}/${cmName}`),
+      enabled: isPod,
+      staleTime: 30000,
+    })),
+  })
+
+  const secretQueries = useQueries({
+    queries: envFromSecretNames.map((secretName) => ({
+      queryKey: ['resources', 'secrets', namespace, secretName],
+      queryFn: () => fetchJSON<any>(`/resources/secrets/${namespace}/${secretName}`),
+      enabled: isPod,
+      staleTime: 30000,
+    })),
+  })
+
+  const resolvedEnvFrom = useMemo(() => {
+    if (!isPod || (envFromConfigMapNames.length === 0 && envFromSecretNames.length === 0)) return undefined
+    const result: ResolvedEnvFrom = {}
+    envFromConfigMapNames.forEach((n, i) => {
+      // Single-resource endpoint returns { resource, relationships } wrapper
+      const cm = configMapQueries[i]?.data?.resource ?? configMapQueries[i]?.data
+      if (cm) result[n] = { keys: Object.keys(cm.data || {}), values: cm.data || {}, isSecret: false }
+    })
+    envFromSecretNames.forEach((n, i) => {
+      const secret = secretQueries[i]?.data?.resource ?? secretQueries[i]?.data
+      if (secret) {
+        const decodedValues: Record<string, string> = {}
+        for (const [k, v] of Object.entries(secret.data || {})) {
+          try { decodedValues[k] = atob(v as string) } catch { decodedValues[k] = v as string }
+        }
+        result[n] = { keys: Object.keys(decodedValues), values: decodedValues, isSecret: true }
+      }
+    })
+    return Object.keys(result).length > 0 ? result : undefined
+  }, [isPod, envFromConfigMapNames, envFromSecretNames, configMapQueries, secretQueries])
+
   // Fetch topology for hierarchy building (only when expanded)
   const { data: topology } = useTopology([namespace], 'resources', { enabled: expanded })
 
@@ -266,6 +323,7 @@ export function WorkloadView({
       }
       actionsBarProps={actionsBarProps}
       rendererOverrides={rendererOverrides}
+      resolvedEnvFrom={resolvedEnvFrom}
     />
   )
 }
