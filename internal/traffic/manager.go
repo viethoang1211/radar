@@ -621,5 +621,12 @@ func carettaHelmChart() *HelmChartInfo {
 		Repo:      "groundcover",
 		RepoURL:   "https://helm.groundcover.com/",
 		ChartName: "caretta",
+		DefaultValues: map[string]any{
+			"resources": map[string]any{
+				"limits": map[string]any{
+					"memory": "512Mi",
+				},
+			},
+		},
 	}
 }

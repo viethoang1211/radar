@@ -130,10 +130,11 @@ type Recommendation struct {
 
 // HelmChartInfo contains info needed to install a chart via the Helm view
 type HelmChartInfo struct {
-	Repo      string `json:"repo"`      // Repository name (e.g., "groundcover")
-	RepoURL   string `json:"repoUrl"`   // Repository URL
-	ChartName string `json:"chartName"` // Chart name (e.g., "caretta")
-	Version   string `json:"version"`   // Optional specific version
+	Repo          string         `json:"repo"`                    // Repository name (e.g., "groundcover")
+	RepoURL       string         `json:"repoUrl"`                 // Repository URL
+	ChartName     string         `json:"chartName"`               // Chart name (e.g., "caretta")
+	Version       string         `json:"version"`                 // Optional specific version
+	DefaultValues map[string]any `json:"defaultValues,omitempty"` // Default values to pre-populate in the install wizard
 }
 
 // SourcesResponse is the response for GET /api/traffic/sources
