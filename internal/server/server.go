@@ -125,6 +125,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/events/stream", s.broadcaster.HandleSSE)
 		r.Get("/pods/{namespace}/{name}/logs/stream", s.handlePodLogsStream)
 		r.Get("/pods/{namespace}/{name}/exec", s.handlePodExec)
+		r.Get("/local-terminal", s.handleLocalTerminal)
 		r.Get("/pods/{namespace}/{name}/files/download", s.handlePodFileDownload)
 		r.Get("/workloads/{kind}/{namespace}/{name}/logs/stream", s.handleWorkloadLogsStream)
 
@@ -376,6 +377,7 @@ func (s *Server) Handler() http.Handler {
 
 // Stop gracefully stops the server and releases the listening port.
 func (s *Server) Stop() {
+	StopAllLocalTermSessions()
 	s.broadcaster.Stop()
 	if s.listener != nil {
 		s.listener.Close()
@@ -458,6 +460,22 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	caps.MCPEnabled = s.mcpHandler != nil
+
+	// Namespace-scoped re-check: when exec/logs/portForward are denied by the
+	// initial RBAC checks (cluster-wide + effective-namespace fallback), re-check
+	// scoped to the specific namespace the user is viewing. Users with
+	// namespace-scoped RoleBindings may have these permissions in namespaces
+	// other than the kubeconfig default.
+	if ns := r.URL.Query().Get("namespace"); ns != "" {
+		nsCaps, err := k8s.CheckNamespaceCapabilities(r.Context(), ns, caps)
+		if err != nil {
+			log.Printf("[capabilities] namespace-scoped check for %q failed: %v", ns, err)
+		} else if nsCaps != nil {
+			caps.Exec = nsCaps.Exec
+			caps.Logs = nsCaps.Logs
+			caps.PortForward = nsCaps.PortForward
+		}
+	}
 
 	// Include resource permissions if cache is available
 	if cache := k8s.GetResourceCache(); cache != nil {
@@ -1825,18 +1843,21 @@ func (s *Server) handleRollbackWorkload(w http.ResponseWriter, r *http.Request) 
 
 // SessionCounts returns counts of active sessions
 type SessionCounts struct {
-	PortForwards int `json:"portForwards"`
-	ExecSessions int `json:"execSessions"`
-	Total        int `json:"total"`
+	PortForwards   int `json:"portForwards"`
+	ExecSessions   int `json:"execSessions"`
+	LocalTerminals int `json:"localTerminals"`
+	Total          int `json:"total"`
 }
 
 func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 	pf := GetPortForwardCount()
 	exec := GetExecSessionCount()
+	lt := GetLocalTermSessionCount()
 	s.writeJSON(w, SessionCounts{
-		PortForwards: pf,
-		ExecSessions: exec,
-		Total:        pf + exec,
+		PortForwards:   pf,
+		ExecSessions:   exec,
+		LocalTerminals: lt,
+		Total:          pf + exec + lt,
 	})
 }
 
