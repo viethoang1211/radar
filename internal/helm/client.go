@@ -1811,24 +1811,44 @@ func (c *Client) InstallWithProgress(req *InstallRequest, progressCh chan<- Inst
 
 	sendProgress("downloading", fmt.Sprintf("Downloading chart %s-%s...", req.ChartName, req.Version), chartURL)
 
+	// Download the chart archive directly via HTTP, bypassing the Helm SDK's
+	// ChartPathOptions.LocateChart / ChartDownloader machinery. That code loads
+	// every locally-registered repo's cached index file and fails with "no cached
+	// repo found" if any index file is stale or missing (e.g. a bitnami repo
+	// entry exists in repositories.yaml but the index cache was deleted).
+	chartResp, err := httpClient.Get(chartURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download chart: %w", err)
+	}
+	defer chartResp.Body.Close()
+	if chartResp.StatusCode != 200 {
+		return nil, fmt.Errorf("failed to download chart: server returned %d", chartResp.StatusCode)
+	}
+
+	tmpChart, err := os.CreateTemp("", "helm-chart-*.tgz")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file for chart: %w", err)
+	}
+	defer os.Remove(tmpChart.Name())
+	defer tmpChart.Close()
+
+	if _, err := tmpChart.ReadFrom(chartResp.Body); err != nil {
+		return nil, fmt.Errorf("failed to write chart to temp file: %w", err)
+	}
+	tmpChart.Close()
+
+	sendProgress("loading", "Loading chart...", tmpChart.Name())
+
+	chart, err := loader.Load(tmpChart.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chart: %w", err)
+	}
+
 	installAction := action.NewInstall(actionConfig)
 	installAction.ReleaseName = req.ReleaseName
 	installAction.Namespace = req.Namespace
 	installAction.CreateNamespace = req.CreateNamespace
 	installAction.Timeout = 120 * time.Second
-	installAction.Version = req.Version
-
-	cp, err := installAction.ChartPathOptions.LocateChart(chartURL, c.settings)
-	if err != nil {
-		return nil, fmt.Errorf("failed to locate chart: %w", err)
-	}
-
-	sendProgress("loading", "Loading chart...", cp)
-
-	chart, err := loader.Load(cp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load chart: %w", err)
-	}
 
 	sendProgress("installing", fmt.Sprintf("Installing %s to namespace %s...", req.ReleaseName, req.Namespace), "")
 

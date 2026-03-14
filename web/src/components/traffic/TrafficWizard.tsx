@@ -76,6 +76,7 @@ export function TrafficWizard({
       version={helmChart.version || 'latest'}
       source="artifacthub"
       repoUrl={helmChart.repoUrl}  // Pass direct repo URL for non-ArtifactHub charts
+      defaultValues={helmChart.defaultValues}
       onClose={() => setShowHelmInstall(false)}
       onSuccess={() => {
         setShowHelmInstall(false)

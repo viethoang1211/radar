@@ -11,12 +11,28 @@ import { YamlEditor } from '../ui/YamlEditor'
 import { Tooltip } from '../ui/Tooltip'
 import { Markdown } from '../ui/Markdown'
 
+// Deep merge two objects — values from `overrides` take priority
+function deepMerge(base: Record<string, unknown>, overrides: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...base }
+  for (const key of Object.keys(overrides)) {
+    const baseVal = base[key]
+    const overVal = overrides[key]
+    if (baseVal && overVal && typeof baseVal === 'object' && typeof overVal === 'object' && !Array.isArray(baseVal) && !Array.isArray(overVal)) {
+      result[key] = deepMerge(baseVal as Record<string, unknown>, overVal as Record<string, unknown>)
+    } else {
+      result[key] = overVal
+    }
+  }
+  return result
+}
+
 interface InstallWizardProps {
   repo: string
   chartName: string
   version: string
   source: ChartSource
   repoUrl?: string  // Direct repo URL (overrides ArtifactHub lookup)
+  defaultValues?: Record<string, unknown>  // Pre-populated values (e.g., resource limits from traffic wizard)
   onClose: () => void
   onSuccess: (namespace: string, releaseName: string) => void
 }
@@ -31,7 +47,7 @@ interface ProgressEntry {
   timestamp: Date
 }
 
-export function InstallWizard({ repo, chartName, version, source, repoUrl, onClose, onSuccess }: InstallWizardProps) {
+export function InstallWizard({ repo, chartName, version, source, repoUrl, defaultValues, onClose, onSuccess }: InstallWizardProps) {
   const [step, setStep] = useState<WizardStep>('info')
   const [releaseName, setReleaseName] = useState(chartName)
   const [namespace, setNamespace] = useState(chartName)
@@ -72,15 +88,28 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, onClo
     }
   }, [progressLogs])
 
-  // Initialize values from chart defaults
+  // Initialize values from chart defaults, merging any pre-populated defaultValues on top
   useEffect(() => {
+    let baseValues: Record<string, unknown> | undefined
     if (isLocal && localChartDetail?.values) {
-      setValuesYaml(yaml.stringify(localChartDetail.values))
+      baseValues = localChartDetail.values as Record<string, unknown>
     } else if (!isLocal && artifactHubDetail?.values) {
-      // ArtifactHub returns values as a string
-      setValuesYaml(artifactHubDetail.values)
+      try {
+        baseValues = yaml.parse(artifactHubDetail.values) as Record<string, unknown>
+      } catch {
+        // If parsing fails, use the raw string as-is
+        setValuesYaml(artifactHubDetail.values)
+        return
+      }
     }
-  }, [localChartDetail?.values, artifactHubDetail?.values, isLocal])
+    if (baseValues && defaultValues) {
+      setValuesYaml(yaml.stringify(deepMerge(baseValues, defaultValues)))
+    } else if (defaultValues && !baseValues) {
+      setValuesYaml(yaml.stringify(defaultValues))
+    } else if (baseValues) {
+      setValuesYaml(yaml.stringify(baseValues))
+    }
+  }, [localChartDetail?.values, artifactHubDetail?.values, isLocal, defaultValues])
 
   const handleInstall = useCallback(async () => {
     let values: Record<string, unknown> | undefined
@@ -755,7 +784,7 @@ function ReviewStep({
     for (const line of lines) {
       // Skip diff metadata lines
       if (line.startsWith('Index:') || line.startsWith('===') ||
-          line.startsWith('---') || line.startsWith('+++')) {
+        line.startsWith('---') || line.startsWith('+++')) {
         continue
       }
 
@@ -938,8 +967,8 @@ function InstallingStep({
       <div className={clsx(
         'flex items-center gap-3 p-4 rounded-lg border',
         isComplete ? 'bg-green-500/10 border-green-500/30' :
-        installError ? 'bg-red-500/10 border-red-500/30' :
-        'bg-blue-500/10 border-blue-500/30'
+          installError ? 'bg-red-500/10 border-red-500/30' :
+            'bg-blue-500/10 border-blue-500/30'
       )}>
         {isComplete ? (
           <CheckCircle className="w-6 h-6 text-green-400 shrink-0" />
@@ -952,17 +981,17 @@ function InstallingStep({
           <p className={clsx(
             'text-sm font-medium',
             isComplete ? 'text-green-400' :
-            installError ? 'text-red-400' :
-            'text-theme-text-primary'
+              installError ? 'text-red-400' :
+                'text-theme-text-primary'
           )}>
             {isComplete ? 'Installation Complete' :
-             installError ? 'Installation Failed' :
-             `Installing ${chartName}...`}
+              installError ? 'Installation Failed' :
+                `Installing ${chartName}...`}
           </p>
           <p className="text-xs text-theme-text-secondary mt-0.5">
             {isComplete ? `${releaseName} is now running in ${namespace}` :
-             installError ? 'See logs below for details' :
-             `Deploying to namespace ${namespace}`}
+              installError ? 'See logs below for details' :
+                `Deploying to namespace ${namespace}`}
           </p>
         </div>
       </div>
@@ -992,15 +1021,15 @@ function InstallingStep({
               <span className={clsx(
                 'shrink-0 px-1.5 py-0.5 rounded text-xs uppercase',
                 log.phase === 'error' ? 'bg-red-500/20 text-red-400' :
-                log.phase === 'complete' ? 'bg-green-500/20 text-green-400' :
-                'bg-theme-elevated text-theme-text-tertiary'
+                  log.phase === 'complete' ? 'bg-green-500/20 text-green-400' :
+                    'bg-theme-elevated text-theme-text-tertiary'
               )}>
                 {log.phase}
               </span>
               <span className={clsx(
                 log.phase === 'error' ? 'text-red-400' :
-                log.phase === 'complete' ? 'text-green-400' :
-                'text-theme-text-secondary'
+                  log.phase === 'complete' ? 'text-green-400' :
+                    'text-theme-text-secondary'
               )}>
                 {log.message}
               </span>

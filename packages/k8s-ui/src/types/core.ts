@@ -755,6 +755,7 @@ export interface TrafficHelmChartInfo {
   repoUrl: string
   chartName: string
   version?: string
+  defaultValues?: Record<string, unknown>
 }
 
 // Recommendation for installing a traffic source
