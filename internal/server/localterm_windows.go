@@ -13,8 +13,8 @@ import (
 )
 
 // conPty wraps a Windows ConPTY pseudo-console.
-// Uses raw Windows handles + ReadFile/WriteFile to avoid Go's IOCP-based
-// os.File I/O which conflicts with ConPTY's synchronous pipe handles.
+// Uses raw Windows handles + ReadFile/WriteFile directly to avoid Go's os.File
+// wrapper, which is incompatible with ConPTY's synchronous anonymous pipes.
 type conPty struct {
 	console windows.Handle
 	inWrite windows.Handle // our write end → ConPTY input
@@ -64,8 +64,8 @@ func getDefaultShell() string {
 }
 
 func startShell(shell string, env []string, dir string) (*shellProcess, error) {
-	// Create pipes using raw Windows API to avoid Go's IOCP-based os.File I/O,
-	// which conflicts with ConPTY's synchronous pipe model (Go 1.22+ issue).
+	// Create pipes using raw Windows API to avoid Go's os.File wrapper,
+	// which is incompatible with ConPTY's synchronous anonymous pipes.
 	// ConPTY reads from inRead, writes to outWrite.
 	// We write to inWrite, read from outRead.
 	var inRead, inWrite windows.Handle
