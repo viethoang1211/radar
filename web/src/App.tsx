@@ -39,7 +39,7 @@ import { useTheme } from './context/ThemeContext'
 import { Tooltip } from './components/ui/Tooltip'
 import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNamespacePicker'
 import { SettingsDialog } from './components/settings/SettingsDialog'
-import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, Topology } from './types'
+import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, Topology, K8sEvent } from './types'
 import { kindToPlural, openExternal } from './utils/navigation'
 
 // All possible node kinds (core + GitOps)
@@ -334,6 +334,48 @@ function AppInner() {
   // Query client for cache invalidation
   const queryClient = useQueryClient()
 
+  // SSE-driven cache invalidation for resource lists, counts, and detail views.
+  // Uses a 3-second throttle window: first event starts the timer, all events within the
+  // window accumulate, then fire a single batch invalidation. This keeps max latency at 3s
+  // while coalescing burst events (e.g., 100-pod rollout → ~10 invalidations total).
+  const pendingInvalidationRef = useRef<{
+    kinds: Set<string>
+    hasCountChange: boolean
+    timer: number | null
+  }>({ kinds: new Set(), hasCountChange: false, timer: null })
+
+  const handleK8sEvent = useCallback((event: K8sEvent) => {
+    // Skip K8s Event kind — informational, not resource mutations
+    if (event.kind === 'Event') return
+
+    const pending = pendingInvalidationRef.current
+    pending.kinds.add(kindToPlural(event.kind))
+    if (event.operation === 'add' || event.operation === 'delete') {
+      pending.hasCountChange = true
+    }
+
+    // Start throttle window on first event (don't reset — bounded 3s latency)
+    if (pending.timer !== null) return
+    pending.timer = window.setTimeout(() => {
+      for (const kind of pending.kinds) {
+        // Invalidate list queries (['resources', kind, ...]) and detail queries (['resource', kind, ...])
+        queryClient.invalidateQueries({ queryKey: ['resources', kind] })
+        queryClient.invalidateQueries({ queryKey: ['resource', kind] })
+      }
+      if (pending.hasCountChange) {
+        queryClient.invalidateQueries({ queryKey: ['resource-counts'] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      if (pending.kinds.has('secrets')) {
+        queryClient.invalidateQueries({ queryKey: ['secret-cert-expiry'] })
+      }
+      // Reset accumulator
+      pending.kinds = new Set()
+      pending.hasCountChange = false
+      pending.timer = null
+    }, 3000)
+  }, [queryClient])
+
   // SSE connection for real-time updates
   const { topology, connected, reconnect: reconnectSSE } = useEventSource(namespaces, topologyMode, {
     onContextSwitchComplete: endSwitch,
@@ -344,6 +386,12 @@ function AppInner() {
       // removeQueries clears cached data, invalidateQueries triggers refetch
       queryClient.removeQueries()
       queryClient.invalidateQueries()
+
+      // Cancel any pending SSE-driven invalidation — old cluster's events are irrelevant
+      if (pendingInvalidationRef.current.timer !== null) {
+        clearTimeout(pendingInvalidationRef.current.timer)
+        pendingInvalidationRef.current = { kinds: new Set(), hasCountChange: false, timer: null }
+      }
 
       // Close any open drawers/overlays — old cluster's resources don't exist on the new one
       setSelectedResource(null)
@@ -360,6 +408,7 @@ function AppInner() {
       // Refetch dashboard so counts, warning events, and cert health fill in.
       queryClient.invalidateQueries({ queryKey: ['dashboard'] })
     },
+    onK8sEvent: handleK8sEvent,
   })
   const [reconnect, isReconnecting] = useRefreshAnimation(reconnectSSE)
 

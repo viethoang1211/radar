@@ -892,6 +892,7 @@ export interface PrometheusResourceMetrics {
   range: string
   result: PrometheusQueryResult
   query?: string // PromQL query (included when result is empty, for diagnostics)
+  hint?: string  // Contextual hint when results are empty (e.g. cri-docker label issues)
 }
 
 export type PrometheusMetricCategory = 'cpu' | 'memory' | 'network_rx' | 'network_tx' | 'filesystem'
@@ -1103,6 +1104,21 @@ export function useUpdateResource() {
       queryClient.invalidateQueries({ queryKey: ['resources', variables.kind] })
       queryClient.invalidateQueries({ queryKey: ['topology'] })
     },
+  })
+}
+
+// Cascade delete preview — shows resources that will be garbage-collected
+export interface CascadeDeletePreview {
+  root: { kind: string; namespace: string; name: string; group?: string }
+  dependents: { kind: string; namespace: string; name: string; group?: string }[]
+}
+
+export function useCascadeDeletePreview(kind: string, namespace: string, name: string, enabled: boolean) {
+  return useQuery<CascadeDeletePreview>({
+    queryKey: ['cascade-preview', kind, namespace, name],
+    queryFn: () => fetchJSON<CascadeDeletePreview>(`/resources/${kind}/${namespace}/${name}/cascade-preview`),
+    enabled,
+    staleTime: 30_000,
   })
 }
 
