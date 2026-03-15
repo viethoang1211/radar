@@ -105,9 +105,11 @@ func startShell(shell string, env []string, dir string) (*shellProcess, error) {
 	}
 	defer attrs.Delete()
 
+	// Pass the pseudo console handle value directly (not a pointer to it).
+	// HPCON is a void* in C — lpValue expects the handle value itself.
 	err = attrs.Update(
 		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-		unsafe.Pointer(&hPC),
+		unsafe.Pointer(hPC),
 		unsafe.Sizeof(hPC),
 	)
 	if err != nil {
