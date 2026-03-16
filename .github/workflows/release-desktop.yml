@@ -56,6 +56,18 @@ jobs:
       - name: Build macOS .app (universal)
         run: cd cmd/desktop && wails build -platform darwin/universal -ldflags "-X main.version=${GITHUB_REF_NAME#v}"
 
+      - name: Ad-hoc codesign
+        run: |
+          APP="build/bin/radar-desktop.app"
+          # Ad-hoc sign the .app bundle (no Apple Developer identity).
+          # --deep recursively signs nested binaries/frameworks in one pass.
+          # NOTE: --deep is deprecated since macOS 13; acceptable for ad-hoc
+          # but should be replaced with inside-out signing if we adopt a
+          # Developer ID certificate.
+          codesign --force --deep --sign - "$APP"
+          # Fail early if the signature is malformed
+          codesign --verify --verbose "$APP"
+
       - name: Create archive
         run: |
           VERSION="${GITHUB_REF_NAME}"
@@ -386,9 +398,8 @@ jobs:
             app "Radar.app"
 
             caveats <<~EOS
-              Radar Desktop is not yet code-signed. On first launch:
+              Radar Desktop is not yet notarized with Apple. On first launch:
                 Right-click Radar.app → Open → click "Open"
-              Or install with: brew install --cask --no-quarantine radar-desktop
             EOS
           end
           CASK

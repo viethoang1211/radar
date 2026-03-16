@@ -125,8 +125,12 @@ func (s *Server) setupRoutes() {
 		r.Get("/events/stream", s.broadcaster.HandleSSE)
 		r.Get("/pods/{namespace}/{name}/logs/stream", s.handlePodLogsStream)
 		r.Get("/pods/{namespace}/{name}/exec", s.handlePodExec)
+		r.Get("/local-terminal", s.handleLocalTerminal)
 		r.Get("/pods/{namespace}/{name}/files/download", s.handlePodFileDownload)
 		r.Get("/workloads/{kind}/{namespace}/{name}/logs/stream", s.handleWorkloadLogsStream)
+
+		// Node drain — outside 60s timeout group (drain may need minutes for PDB backoff)
+		r.Post("/nodes/{name}/drain", s.handleDrainNode)
 
 		// All other API routes get a 60-second timeout
 		r.Group(func(r chi.Router) {
@@ -147,6 +151,7 @@ func (s *Server) setupRoutes() {
 			r.Get("/resources/{kind}", s.handleListResources)
 			r.Get("/resources/{kind}/{namespace}/{name}", s.handleGetResource)
 			r.Put("/resources/{kind}/{namespace}/{name}", s.handleUpdateResource)
+			r.Get("/resources/{kind}/{namespace}/{name}/cascade-preview", s.handleCascadeDeletePreview)
 			r.Delete("/resources/{kind}/{namespace}/{name}", s.handleDeleteResource)
 			r.Get("/secrets/certificate-expiry", s.handleSecretCertExpiry)
 			r.Get("/events", s.handleEvents)
@@ -162,6 +167,10 @@ func (s *Server) setupRoutes() {
 			// Node debug (privileged debug pod)
 			r.Post("/nodes/{name}/debug", s.handleNodeDebug)
 			r.Delete("/nodes/{name}/debug", s.handleNodeDebugCleanup)
+
+			// Node operations (cordon/uncordon)
+			r.Post("/nodes/{name}/cordon", s.handleCordonNode)
+			r.Post("/nodes/{name}/uncordon", s.handleUncordonNode)
 
 			// Pod file browser
 			r.Get("/pods/{namespace}/{name}/files", s.handlePodFileList)
@@ -369,6 +378,7 @@ func (s *Server) Handler() http.Handler {
 
 // Stop gracefully stops the server and releases the listening port.
 func (s *Server) Stop() {
+	StopAllLocalTermSessions()
 	s.broadcaster.Stop()
 	if s.listener != nil {
 		s.listener.Close()
@@ -451,6 +461,22 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	caps.MCPEnabled = s.mcpHandler != nil
+
+	// Namespace-scoped re-check: when exec/logs/portForward are denied by the
+	// initial RBAC checks (cluster-wide + effective-namespace fallback), re-check
+	// scoped to the specific namespace the user is viewing. Users with
+	// namespace-scoped RoleBindings may have these permissions in namespaces
+	// other than the kubeconfig default.
+	if ns := r.URL.Query().Get("namespace"); ns != "" {
+		nsCaps, err := k8s.CheckNamespaceCapabilities(r.Context(), ns, caps)
+		if err != nil {
+			log.Printf("[capabilities] namespace-scoped check for %q failed: %v", ns, err)
+		} else if nsCaps != nil {
+			caps.Exec = nsCaps.Exec
+			caps.Logs = nsCaps.Logs
+			caps.PortForward = nsCaps.PortForward
+		}
+	}
 
 	// Include resource permissions if cache is available
 	if cache := k8s.GetResourceCache(); cache != nil {
@@ -1569,6 +1595,27 @@ func (s *Server) handleDeleteResource(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleCascadeDeletePreview returns a preview of resources that would be garbage-collected
+// if the specified resource is deleted (via Kubernetes owner reference cascade).
+func (s *Server) handleCascadeDeletePreview(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConnected(w) {
+		return
+	}
+
+	kind := chi.URLParam(r, "kind")
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	if namespace == "_" {
+		namespace = ""
+	}
+
+	cachedTopo := s.broadcaster.GetCachedTopology()
+	dp := k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())
+	preview := topology.GetCascadeDeletePreview(kind, namespace, name, cachedTopo, dp)
+
+	s.writeJSON(w, preview)
+}
+
 // handleTriggerCronJob creates a Job from a CronJob
 func (s *Server) handleTriggerCronJob(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
@@ -1818,18 +1865,21 @@ func (s *Server) handleRollbackWorkload(w http.ResponseWriter, r *http.Request) 
 
 // SessionCounts returns counts of active sessions
 type SessionCounts struct {
-	PortForwards int `json:"portForwards"`
-	ExecSessions int `json:"execSessions"`
-	Total        int `json:"total"`
+	PortForwards   int `json:"portForwards"`
+	ExecSessions   int `json:"execSessions"`
+	LocalTerminals int `json:"localTerminals"`
+	Total          int `json:"total"`
 }
 
 func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 	pf := GetPortForwardCount()
 	exec := GetExecSessionCount()
+	lt := GetLocalTermSessionCount()
 	s.writeJSON(w, SessionCounts{
-		PortForwards: pf,
-		ExecSessions: exec,
-		Total:        pf + exec,
+		PortForwards:   pf,
+		ExecSessions:   exec,
+		LocalTerminals: lt,
+		Total:          pf + exec + lt,
 	})
 }
 

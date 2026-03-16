@@ -16,12 +16,13 @@ import { TrafficView } from './components/traffic/TrafficView'
 import { CostView } from './components/cost/CostView'
 import { HelmReleaseDrawer } from './components/helm/HelmReleaseDrawer'
 import { PortForwardManager, usePortForwardCount } from './components/portforward/PortForwardManager'
-import { DockProvider, BottomDock, useDock } from './components/dock'
+import { DockProvider, BottomDock, useDock, useOpenLocalTerminal } from './components/dock'
+import { DURATION_DOCK } from '@skyhook-io/k8s-ui/utils/animation'
 import { ContextSwitcher } from './components/ContextSwitcher'
 import { ContextSwitchProvider, useContextSwitch } from './context/ContextSwitchContext'
 import { ConnectionProvider, useConnection } from './context/ConnectionContext'
 import { ConnectionErrorView } from './components/ConnectionErrorView'
-import { CapabilitiesProvider } from './contexts/CapabilitiesContext'
+import { CapabilitiesProvider, useCapabilitiesContext } from './contexts/CapabilitiesContext'
 import { ErrorBoundary } from './components/ui/ErrorBoundary'
 import { NamespaceSelector } from './components/ui/NamespaceSelector'
 import { UpdateNotification } from './components/ui/UpdateNotification'
@@ -33,12 +34,12 @@ import { useNamespaces, useSwitchContext } from './api/client'
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
 import { Loader2 } from 'lucide-react'
-import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, Settings } from 'lucide-react'
+import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, Settings, SquareTerminal } from 'lucide-react'
 import { useTheme } from './context/ThemeContext'
 import { Tooltip } from './components/ui/Tooltip'
 import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNamespacePicker'
 import { SettingsDialog } from './components/settings/SettingsDialog'
-import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, Topology } from './types'
+import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, Topology, K8sEvent } from './types'
 import { kindToPlural, openExternal } from './utils/navigation'
 
 // All possible node kinds (core + GitOps)
@@ -51,6 +52,7 @@ const ALL_NODE_KINDS: NodeKind[] = [
   'Broker', 'Trigger', 'PingSource', 'ApiServerSource', 'ContainerSource', 'SinkBinding', 'Channel',
   'IngressRoute', 'IngressRouteTCP', 'IngressRouteUDP', 'Middleware', 'MiddlewareTCP',
   'TraefikService', 'ServersTransport', 'ServersTransportTCP', 'TLSOption', 'TLSStore',
+  'HTTPProxy', // Contour
 ]
 
 // Default visible kinds (ReplicaSet hidden by default - noisy intermediate object)
@@ -78,6 +80,7 @@ function apiResourceToNodeIdPrefix(apiResource: string): string {
     'cronjobs': 'cronjob',
     'persistentvolumeclaims': 'persistentvolumeclaim',
     'namespaces': 'namespace',
+    'httpproxies': 'httpproxy', // Contour
   }
   return prefixMap[apiResource] || apiResource.replace(/s$/, '')
 }
@@ -103,6 +106,8 @@ function AppInner() {
   const navigate = useNavigate()
   const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
+  const capabilities = useCapabilitiesContext()
+  const openLocalTerminal = useOpenLocalTerminal()
 
   // Parse namespaces from URL (supports both 'namespaces' and legacy 'namespace')
   const parseNamespacesFromURL = (params: URLSearchParams): string[] => {
@@ -329,6 +334,48 @@ function AppInner() {
   // Query client for cache invalidation
   const queryClient = useQueryClient()
 
+  // SSE-driven cache invalidation for resource lists, counts, and detail views.
+  // Uses a 3-second throttle window: first event starts the timer, all events within the
+  // window accumulate, then fire a single batch invalidation. This keeps max latency at 3s
+  // while coalescing burst events (e.g., 100-pod rollout → ~10 invalidations total).
+  const pendingInvalidationRef = useRef<{
+    kinds: Set<string>
+    hasCountChange: boolean
+    timer: number | null
+  }>({ kinds: new Set(), hasCountChange: false, timer: null })
+
+  const handleK8sEvent = useCallback((event: K8sEvent) => {
+    // Skip K8s Event kind — informational, not resource mutations
+    if (event.kind === 'Event') return
+
+    const pending = pendingInvalidationRef.current
+    pending.kinds.add(kindToPlural(event.kind))
+    if (event.operation === 'add' || event.operation === 'delete') {
+      pending.hasCountChange = true
+    }
+
+    // Start throttle window on first event (don't reset — bounded 3s latency)
+    if (pending.timer !== null) return
+    pending.timer = window.setTimeout(() => {
+      for (const kind of pending.kinds) {
+        // Invalidate list queries (['resources', kind, ...]) and detail queries (['resource', kind, ...])
+        queryClient.invalidateQueries({ queryKey: ['resources', kind] })
+        queryClient.invalidateQueries({ queryKey: ['resource', kind] })
+      }
+      if (pending.hasCountChange) {
+        queryClient.invalidateQueries({ queryKey: ['resource-counts'] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      if (pending.kinds.has('secrets')) {
+        queryClient.invalidateQueries({ queryKey: ['secret-cert-expiry'] })
+      }
+      // Reset accumulator
+      pending.kinds = new Set()
+      pending.hasCountChange = false
+      pending.timer = null
+    }, 3000)
+  }, [queryClient])
+
   // SSE connection for real-time updates
   const { topology, connected, reconnect: reconnectSSE } = useEventSource(namespaces, topologyMode, {
     onContextSwitchComplete: endSwitch,
@@ -339,6 +386,12 @@ function AppInner() {
       // removeQueries clears cached data, invalidateQueries triggers refetch
       queryClient.removeQueries()
       queryClient.invalidateQueries()
+
+      // Cancel any pending SSE-driven invalidation — old cluster's events are irrelevant
+      if (pendingInvalidationRef.current.timer !== null) {
+        clearTimeout(pendingInvalidationRef.current.timer)
+        pendingInvalidationRef.current = { kinds: new Set(), hasCountChange: false, timer: null }
+      }
 
       // Close any open drawers/overlays — old cluster's resources don't exist on the new one
       setSelectedResource(null)
@@ -355,6 +408,7 @@ function AppInner() {
       // Refetch dashboard so counts, warning events, and cert health fill in.
       queryClient.invalidateQueries({ queryKey: ['dashboard'] })
     },
+    onK8sEvent: handleK8sEvent,
   })
   const [reconnect, isReconnecting] = useRefreshAnimation(reconnectSSE)
 
@@ -655,6 +709,17 @@ function AppInner() {
           <div className="hidden lg:block">
             <GitHubStarButton />
           </div>
+
+          {/* Local terminal */}
+          {capabilities.localTerminal && (
+            <button
+              onClick={openLocalTerminal}
+              className="p-1.5 rounded-md bg-theme-elevated hover:bg-theme-hover text-theme-text-secondary hover:text-theme-text-primary transition-colors"
+              title="Open local terminal"
+            >
+              <SquareTerminal className="w-4 h-4" />
+            </button>
+          )}
 
           {/* Theme toggle */}
           <div className="hidden md:block">
@@ -1109,7 +1174,7 @@ function NamespaceFilterDialog({ namespaces, onConfirm, onKeep, onClose }: {
 function DockSpacer() {
   const { tabs, isExpanded } = useDock()
   if (tabs.length === 0) return null
-  return <div style={{ height: isExpanded ? 300 : 36 }} />
+  return <div style={{ height: isExpanded ? 300 : 36, transition: `height ${DURATION_DOCK}ms cubic-bezier(0.4, 0, 0.2, 1)` }} />
 }
 
 // Floating action buttons that position themselves above the dock

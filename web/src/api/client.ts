@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient, skipToken } from '@tanstack/react-query'
+import { showApiError, showApiSuccess } from '../components/ui/Toast'
 import type {
   Topology,
   ClusterInfo,
@@ -513,6 +514,19 @@ export function useCapabilities() {
   })
 }
 
+// Namespace-scoped capabilities: lazy re-check for exec/logs/portForward when
+// global RBAC checks denied them. Users with namespace-scoped RoleBindings may
+// have these permissions in specific namespaces.
+export function useNamespaceCapabilities(namespace: string | undefined, globalCaps: Capabilities) {
+  const needsCheck = namespace && (!globalCaps.exec || !globalCaps.logs || !globalCaps.portForward)
+  return useQuery<Capabilities>({
+    queryKey: ['capabilities', namespace],
+    queryFn: () => fetchJSON(`/capabilities?namespace=${encodeURIComponent(namespace!)}`),
+    enabled: !!needsCheck,
+    staleTime: 60000,
+  })
+}
+
 // Namespaces
 export function useNamespaces() {
   return useQuery<Namespace[]>({
@@ -878,6 +892,7 @@ export interface PrometheusResourceMetrics {
   range: string
   result: PrometheusQueryResult
   query?: string // PromQL query (included when result is empty, for diagnostics)
+  hint?: string  // Contextual hint when results are empty (e.g. cri-docker label issues)
 }
 
 export type PrometheusMetricCategory = 'cpu' | 'memory' | 'network_rx' | 'network_tx' | 'filesystem'
@@ -1089,6 +1104,21 @@ export function useUpdateResource() {
       queryClient.invalidateQueries({ queryKey: ['resources', variables.kind] })
       queryClient.invalidateQueries({ queryKey: ['topology'] })
     },
+  })
+}
+
+// Cascade delete preview — shows resources that will be garbage-collected
+export interface CascadeDeletePreview {
+  root: { kind: string; namespace: string; name: string; group?: string }
+  dependents: { kind: string; namespace: string; name: string; group?: string }[]
+}
+
+export function useCascadeDeletePreview(kind: string, namespace: string, name: string, enabled: boolean) {
+  return useQuery<CascadeDeletePreview>({
+    queryKey: ['cascade-preview', kind, namespace, name],
+    queryFn: () => fetchJSON<CascadeDeletePreview>(`/resources/${kind}/${namespace}/${name}/cascade-preview`),
+    enabled,
+    staleTime: 30_000,
   })
 }
 
@@ -1311,6 +1341,106 @@ export function useRollbackWorkload() {
       queryClient.invalidateQueries({ queryKey: ['resource', variables.kind, variables.namespace, variables.name] })
       queryClient.invalidateQueries({ queryKey: ['workload-revisions', variables.kind, variables.namespace, variables.name] })
       queryClient.invalidateQueries({ queryKey: ['topology'] })
+    },
+  })
+}
+
+// ============================================================================
+// Node operations (cordon, uncordon, drain)
+// ============================================================================
+
+export function useCordonNode() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ name }: { name: string }) => {
+      const response = await fetch(`${API_BASE}/nodes/${name}/cordon`, {
+        method: 'POST',
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
+      }
+      return response.json()
+    },
+    meta: {
+      errorMessage: 'Failed to cordon node',
+      successMessage: 'Node cordoned',
+    },
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['resources', 'nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['resource', 'nodes', '', variables.name] })
+      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    },
+  })
+}
+
+export function useUncordonNode() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ name }: { name: string }) => {
+      const response = await fetch(`${API_BASE}/nodes/${name}/uncordon`, {
+        method: 'POST',
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
+      }
+      return response.json()
+    },
+    meta: {
+      errorMessage: 'Failed to uncordon node',
+      successMessage: 'Node uncordoned',
+    },
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['resources', 'nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['resource', 'nodes', '', variables.name] })
+      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    },
+  })
+}
+
+export interface DrainNodeOptions {
+  deleteEmptyDirData?: boolean
+  force?: boolean
+}
+
+export function useDrainNode() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ name, options }: { name: string; options?: DrainNodeOptions }) => {
+      const response = await fetch(`${API_BASE}/nodes/${name}/drain`, {
+        method: 'POST',
+        headers: options ? { 'Content-Type': 'application/json' } : {},
+        body: options ? JSON.stringify(options) : undefined,
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
+      }
+      return response.json()
+    },
+    meta: {
+      errorMessage: 'Failed to drain node',
+      // No static successMessage — handled in onSuccess to distinguish partial failures
+    },
+    onSuccess: (data: { evictedPods?: string[]; errors?: string[] }, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['resources', 'nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['resource', 'nodes', '', variables.name] })
+      queryClient.invalidateQueries({ queryKey: ['topology'] })
+
+      const evicted = data?.evictedPods?.length ?? 0
+      const errors = data?.errors?.length ?? 0
+      if (errors > 0) {
+        showApiError(
+          `Drain completed with ${errors} error(s)`,
+          `${evicted} pods evicted. Errors: ${data.errors!.join('; ')}`,
+        )
+      } else {
+        showApiSuccess(`Node drained: ${evicted} pods evicted`)
+      }
     },
   })
 }

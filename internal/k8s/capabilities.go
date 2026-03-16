@@ -54,13 +54,24 @@ type PermissionCheckResult struct {
 // Capabilities represents the features available based on RBAC permissions
 type Capabilities struct {
 	Exec          bool                 `json:"exec"`                // Can create pods/exec (terminal feature)
+	LocalTerminal bool                 `json:"localTerminal"`       // Local terminal available (not in-cluster, not disabled)
 	Logs          bool                 `json:"logs"`                // Can get pods/log (log viewer)
 	PortForward   bool                 `json:"portForward"`         // Can create pods/portforward
 	Secrets       bool                 `json:"secrets"`             // Can list secrets
 	SecretsUpdate bool                 `json:"secretsUpdate"`       // Can update secrets (inline editing)
 	HelmWrite     bool                 `json:"helmWrite"`           // Helm write ops (detected via secrets/create as sentinel RBAC check)
+	NodeWrite     bool                 `json:"nodeWrite"`           // Can patch nodes (cordon/uncordon/drain)
 	MCPEnabled    bool                 `json:"mcpEnabled"`          // MCP server is running
 	Resources     *ResourcePermissions `json:"resources,omitempty"` // Per-resource-type permissions
+}
+
+// NamespaceCapabilities holds the effective exec/logs/portForward capabilities
+// for a specific namespace. When global checks deny these capabilities,
+// namespace-scoped RBAC re-checks may grant them.
+type NamespaceCapabilities struct {
+	Exec        bool `json:"exec"`
+	Logs        bool `json:"logs"`
+	PortForward bool `json:"portForward"`
 }
 
 var (
@@ -70,11 +81,24 @@ var (
 	capabilitiesTTL      = 60 * time.Second
 	capabilitiesErrorTTL = 5 * time.Second // Short TTL when API errors caused fail-closed results
 
+	// Per-namespace capability cache for lazy RBAC re-checks.
+	// When global checks (cluster-wide + effective-namespace) deny
+	// exec/logs/portForward, callers can re-check for a specific namespace.
+	nsCapCache   map[string]*nsCapEntry
+	nsCapMu      sync.RWMutex
+
 	// ForceDisableHelmWrite overrides the helmWrite capability to false (for dev testing)
 	ForceDisableHelmWrite bool
 	// ForceDisableExec overrides the exec capability to false (for dev testing)
 	ForceDisableExec bool
+	// ForceDisableLocalTerminal overrides the localTerminal capability to false (for dev testing)
+	ForceDisableLocalTerminal bool
 )
+
+type nsCapEntry struct {
+	caps   NamespaceCapabilities
+	expiry time.Time
+}
 
 // CheckCapabilities checks RBAC permissions using SelfSubjectAccessReview.
 // Results are cached for 60 seconds normally, or 5 seconds when API errors
@@ -135,6 +159,7 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 		{"secrets", "list", &caps.Secrets},
 		{"secrets", "update", &caps.SecretsUpdate},
 		{"secrets", "create", &caps.HelmWrite},
+		{"nodes", "patch", &caps.NodeWrite},
 	}
 
 	var wg sync.WaitGroup
@@ -164,6 +189,9 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 
 	wg.Wait()
 	logTiming("   [caps] CheckCapabilities RBAC checks done (%v)", time.Since(capStart))
+
+	// Local terminal is not RBAC-gated — it depends on runtime mode only
+	caps.LocalTerminal = !IsInCluster() && !ForceDisableLocalTerminal
 
 	if ForceDisableHelmWrite {
 		caps.HelmWrite = false
@@ -212,8 +240,113 @@ func GetCachedCapabilities() *Capabilities {
 // InvalidateCapabilitiesCache forces the next CheckCapabilities call to refresh
 func InvalidateCapabilitiesCache() {
 	capabilitiesMu.Lock()
-	defer capabilitiesMu.Unlock()
 	cachedCapabilities = nil
+	capabilitiesMu.Unlock()
+
+	// Also clear namespace-scoped cache
+	nsCapMu.Lock()
+	nsCapCache = nil
+	nsCapMu.Unlock()
+}
+
+// CheckNamespaceCapabilities performs namespace-scoped RBAC checks for capabilities
+// that were denied by global checks (cluster-wide + effective-namespace fallback).
+// This enables lazy re-checking when a user views a resource in a specific namespace —
+// they may have namespace-scoped RoleBindings that grant exec/logs/portForward in
+// namespaces other than the kubeconfig default.
+//
+// Returns nil if no namespace-scoped re-check is needed (all capabilities already allowed).
+func CheckNamespaceCapabilities(ctx context.Context, namespace string, globalCaps *Capabilities) (*NamespaceCapabilities, error) {
+	if namespace == "" {
+		return nil, nil
+	}
+
+	// If all three are already allowed globally, no need for namespace check
+	if globalCaps.Exec && globalCaps.Logs && globalCaps.PortForward {
+		return nil, nil
+	}
+
+	// Check namespace cache
+	nsCapMu.RLock()
+	if nsCapCache != nil {
+		if entry, ok := nsCapCache[namespace]; ok && time.Now().Before(entry.expiry) {
+			result := entry.caps
+			nsCapMu.RUnlock()
+			return &result, nil
+		}
+	}
+	nsCapMu.RUnlock()
+
+	if GetClient() == nil {
+		return nil, nil // No override — caller will use global caps
+	}
+
+	checkCtx, cancel := NewOperationContext(10 * time.Second)
+	defer cancel()
+
+	result := &NamespaceCapabilities{
+		Exec:        globalCaps.Exec,
+		Logs:        globalCaps.Logs,
+		PortForward: globalCaps.PortForward,
+	}
+
+	// Only re-check capabilities that were denied globally
+	type capCheck struct {
+		resource string
+		verb     string
+		result   *bool
+	}
+
+	var checks []capCheck
+	if !globalCaps.Exec && !ForceDisableExec {
+		checks = append(checks, capCheck{"pods/exec", "create", &result.Exec})
+	}
+	if !globalCaps.Logs {
+		checks = append(checks, capCheck{"pods/log", "get", &result.Logs})
+	}
+	if !globalCaps.PortForward {
+		checks = append(checks, capCheck{"pods/portforward", "create", &result.PortForward})
+	}
+
+	if len(checks) == 0 {
+		return result, nil
+	}
+
+	var hadErrors atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(len(checks))
+	for _, check := range checks {
+		go func(c capCheck) {
+			defer wg.Done()
+			allowed, apiErr := canI(checkCtx, namespace, "", c.resource, c.verb)
+			if allowed {
+				*c.result = true
+			}
+			if apiErr {
+				hadErrors.Store(true)
+			}
+		}(check)
+	}
+	wg.Wait()
+
+	// Cache the result. Use short TTL when API errors caused fail-closed results,
+	// matching the pattern in CheckCapabilities.
+	ttl := capabilitiesTTL
+	if hadErrors.Load() {
+		ttl = capabilitiesErrorTTL
+		log.Printf("Warning: namespace %s capability checks had API errors, using short cache TTL (%v)", namespace, ttl)
+	}
+	nsCapMu.Lock()
+	if nsCapCache == nil {
+		nsCapCache = make(map[string]*nsCapEntry)
+	}
+	nsCapCache[namespace] = &nsCapEntry{
+		caps:   *result,
+		expiry: time.Now().Add(ttl),
+	}
+	nsCapMu.Unlock()
+
+	return result, nil
 }
 
 var (

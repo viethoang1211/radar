@@ -77,6 +77,7 @@ const (
 	KindServersTransportTCP  NodeKind = "ServersTransportTCP"  // Traefik ServersTransportTCP
 	KindTLSOption            NodeKind = "TLSOption"            // Traefik TLSOption
 	KindTLSStore             NodeKind = "TLSStore"             // Traefik TLSStore
+	KindHTTPProxy            NodeKind = "HTTPProxy"            // Contour HTTPProxy
 	KindDaemonSet            NodeKind = "DaemonSet"
 	KindStatefulSet   NodeKind = "StatefulSet"
 	KindReplicaSet    NodeKind = "ReplicaSet"
@@ -253,6 +254,13 @@ type CertificateInfo struct {
 // Certificates are in PEM order (leaf-first: index 0 is the server cert, subsequent entries are intermediates/root).
 type SecretCertificateInfo struct {
 	Certificates []CertificateInfo `json:"certificates"`
+}
+
+// CascadeDeletePreview represents all resources that will be garbage-collected
+// when a parent resource is deleted via Kubernetes owner reference cascade.
+type CascadeDeletePreview struct {
+	Root       ResourceRef   `json:"root"`
+	Dependents []ResourceRef `json:"dependents"`
 }
 
 // ResourceWithRelationships wraps a K8s resource with computed relationships

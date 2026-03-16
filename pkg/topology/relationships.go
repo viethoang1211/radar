@@ -6,6 +6,64 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+// GetCascadeDeletePreview returns a preview of all resources that will be garbage-collected
+// when the specified resource is deleted. It walks EdgeManages edges recursively
+// to find all transitive dependents — mirroring Kubernetes owner-reference cascade behavior.
+func GetCascadeDeletePreview(kind, namespace, name string, topo *Topology, dp DynamicProvider) *CascadeDeletePreview {
+	if topo == nil {
+		return &CascadeDeletePreview{
+			Root:       ResourceRef{Kind: kind, Namespace: namespace, Name: name},
+			Dependents: []ResourceRef{},
+		}
+	}
+
+	root := ResourceRef{Kind: kind, Namespace: namespace, Name: name}
+	enrichRef(&root, dp)
+
+	// Build adjacency list for EdgeManages edges (source → targets)
+	manages := make(map[string][]string)
+	for _, edge := range topo.Edges {
+		if edge.Type == EdgeManages {
+			manages[edge.Source] = append(manages[edge.Source], edge.Target)
+		}
+	}
+
+	// BFS from root node
+	rootID := buildNodeID(kind, namespace, name, dp)
+	visited := map[string]bool{rootID: true}
+	queue := []string{rootID}
+	var dependents []ResourceRef
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		for _, targetID := range manages[current] {
+			if visited[targetID] {
+				continue
+			}
+			visited[targetID] = true
+
+			ref := parseNodeID(targetID, dp)
+			if ref == nil {
+				continue
+			}
+			enrichRef(ref, dp)
+			dependents = append(dependents, *ref)
+			queue = append(queue, targetID)
+		}
+	}
+
+	if dependents == nil {
+		dependents = []ResourceRef{}
+	}
+
+	return &CascadeDeletePreview{
+		Root:       root,
+		Dependents: dependents,
+	}
+}
+
 // resolveAPIGroup returns the API group for a resource kind using resource discovery.
 // Returns empty string for core K8s types (pods, services, etc.).
 func resolveAPIGroup(kind string, dp DynamicProvider) string {
@@ -308,6 +366,7 @@ func buildNodeID(kind, namespace, name string, dp DynamicProvider) string {
 		"serverstransporttcps":     "serverstransporttcp",
 		"tlsoptions":               "tlsoption",
 		"tlsstores":                "tlsstore",
+		"httpproxies":              "httpproxy",           // Contour
 		"persistentvolumes":        "persistentvolume",
 		"pvs":                      "persistentvolume",
 		"storageclasses":           "storageclass",
@@ -432,6 +491,7 @@ func normalizeKind(kind string, dp DynamicProvider) string {
 		"serverstransporttcp":     "ServersTransportTCP",
 		"tlsoption":               "TLSOption",
 		"tlsstore":                "TLSStore",
+		"httpproxy":               "HTTPProxy",            // Contour
 		"internet":                "Internet",
 		"persistentvolume":        "PersistentVolume",
 		"storageclass":            "StorageClass",

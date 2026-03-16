@@ -114,6 +114,7 @@ import {
   getServiceAccountSecretCount,
   getRoleRuleCount,
   formatAge,
+  formatDuration,
   truncate,
   getCellFilterValue,
   parseColumnFilters,
@@ -136,6 +137,7 @@ import { CNPGClusterCell, CNPGBackupCell, CNPGScheduledBackupCell, CNPGPoolerCel
 import { VirtualServiceCell, DestinationRuleCell, IstioGatewayCell, ServiceEntryCell, PeerAuthenticationCell, AuthorizationPolicyCell } from './renderers/istio-cells'
 import { KnativeServiceCell, ConfigurationCell as KnativeConfigurationCell, RevisionCell as KnativeRevisionCell, RouteCell as KnativeRouteCell, BrokerCell, TriggerCell, EventTypeCell, PingSourceCell, ApiServerSourceCell, ContainerSourceCell, SinkBindingCell, ChannelCell, InMemoryChannelCell, SubscriptionCell, SequenceCell, ParallelCell, DomainMappingCell, ServerlessServiceCell, KnativeIngressCell, KnativeCertificateCell } from './renderers/knative-cells'
 import { IngressRouteCell, MiddlewareCell, TraefikServiceCell, ServersTransportCell, TLSOptionCell } from './renderers/traefik-cells'
+import { HTTPProxyCell } from './renderers/contour-cells'
 import { useRegisterShortcut, useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
 
 // Pod problem filter options (special multi-select, not a single column value)
@@ -1318,6 +1320,17 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'namespace', label: 'Namespace', width: 'w-36 shrink-0' },
     { key: 'age', label: 'Age', width: 'w-16 shrink-0' },
   ],
+  // Contour
+  httpproxies: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36 shrink-0' },
+    { key: 'fqdn', label: 'FQDN', width: 'min-w-44' },
+    { key: 'routes', label: 'Routes', width: 'w-20 shrink-0' },
+    { key: 'includes', label: 'Includes', width: 'w-24 shrink-0' },
+    { key: 'tls', label: 'TLS', width: 'w-14 shrink-0' },
+    { key: 'status', label: 'Status', width: 'w-24 shrink-0' },
+    { key: 'age', label: 'Age', width: 'w-16 shrink-0' },
+  ],
 }
 
 // Map (plural, group) → KNOWN_COLUMNS key for kinds that collide with core K8s
@@ -1344,6 +1357,8 @@ function normalizeKindToPlural(kind: string, group?: string): string {
   if (!lower.endsWith('s') && KNOWN_COLUMNS[lower + 's']) return lower + 's'
   // Try 'es' for kinds ending in s/sh/ch/x/z (e.g., "ingress" → "ingresses")
   if (KNOWN_COLUMNS[lower + 'es']) return lower + 'es'
+  // Try 'ies' for kinds ending in y (e.g., "httpproxy" → "httpproxies")
+  if (lower.endsWith('y') && KNOWN_COLUMNS[lower.slice(0, -1) + 'ies']) return lower.slice(0, -1) + 'ies'
   return lower
 }
 
@@ -2631,13 +2646,13 @@ export function ResourcesView({
       const kindLower = normalizeKindToPlural(selectedKind.name, selectedKind.group)
 
       if (kindLower === 'pods') {
-        // Completed pods at bottom
+        // Completed pods at bottom, then sort by name for stability across refreshes
         result = [...result].sort((a: any, b: any) => {
           const aCompleted = a.status?.phase === 'Succeeded'
           const bCompleted = b.status?.phase === 'Succeeded'
           if (aCompleted && !bCompleted) return 1
           if (!aCompleted && bCompleted) return -1
-          return 0
+          return (a.metadata?.name || '').localeCompare(b.metadata?.name || '')
         })
       } else if (kindLower === 'daemonsets') {
         // DaemonSets with 0 desired (empty/inactive) at bottom, then sort by ready desc
@@ -2661,11 +2676,12 @@ export function ResourcesView({
           return (a.metadata?.name || '').localeCompare(b.metadata?.name || '')
         })
       } else if (kindLower === 'events') {
-        // Events: most recently seen first
+        // Events: most recently seen first, name tiebreaker for same-timestamp stability
         result = [...result].sort((a: any, b: any) => {
           const aTime = new Date(a.lastTimestamp || a.metadata?.creationTimestamp || 0).getTime()
           const bTime = new Date(b.lastTimestamp || b.metadata?.creationTimestamp || 0).getTime()
-          return bTime - aTime
+          if (bTime !== aTime) return bTime - aTime
+          return (a.metadata?.name || '').localeCompare(b.metadata?.name || '')
         })
       } else if (['deployments', 'statefulsets', 'replicasets'].includes(kindLower)) {
         // Workloads: unhealthy first, scaled-to-zero at bottom
@@ -2688,6 +2704,11 @@ export function ResourcesView({
           // Finally sort by name
           return (a.metadata?.name || '').localeCompare(b.metadata?.name || '')
         })
+      } else {
+        // All other kinds: sort by name for stability across refreshes
+        result = [...result].sort((a: any, b: any) =>
+          (a.metadata?.name || '').localeCompare(b.metadata?.name || '')
+        )
       }
     }
 
@@ -4211,6 +4232,9 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion }
       return <ServersTransportCell resource={resource} column={column} />
     case 'tlsoptions':
       return <TLSOptionCell resource={resource} column={column} />
+    // Contour
+    case 'httpproxies':
+      return <HTTPProxyCell resource={resource} column={column} />
     default:
       // Generic cell for CRDs and unknown resources
       return <GenericCell resource={resource} column={column} />
@@ -4298,11 +4322,88 @@ function PodCell({ resource, column }: { resource: any; column: string }) {
               sq.status === 'terminated' ? 'bg-red-500' :
               'bg-theme-text-tertiary/30 border border-dashed border-theme-text-tertiary'
             const ringClass = sq.restarts > 0 ? 'ring-2 ring-orange-400' : ''
-            const label = `${sq.isInit ? '(init) ' : ''}${sq.name}: ${sq.reason || sq.status}${sq.restarts > 0 ? ` (${sq.restarts} restarts)` : ''}`
+            const dotColor =
+              sq.status === 'ready' ? 'bg-green-500' :
+              sq.status === 'completed' ? 'bg-theme-text-tertiary' :
+              sq.status === 'running' ? 'bg-yellow-500' :
+              sq.status === 'waiting' || sq.status === 'terminated' ? 'bg-red-500' :
+              'bg-theme-text-tertiary'
+            // Relative time helper
+            const timeAgo = (dateStr?: string) => {
+              if (!dateStr) return null
+              const ms = Date.now() - new Date(dateStr).getTime()
+              if (isNaN(ms) || ms < 0) return null
+              if (ms < 60000) return 'just now'
+              return formatDuration(ms) + ' ago'
+            }
+            const runDuration = (start?: string, end?: string) => {
+              if (!start || !end) return null
+              const ms = new Date(end).getTime() - new Date(start).getTime()
+              return ms > 0 ? formatDuration(ms, true) : null
+            }
+            const stateLabel =
+              sq.status === 'ready' ? 'Running' :
+              sq.status === 'completed' ? 'Completed' :
+              sq.status === 'running' ? 'Running (not ready)' :
+              sq.status === 'waiting' ? 'Waiting' :
+              sq.status === 'terminated' ? 'Terminated' : 'Unknown'
+            const uptime = sq.status === 'ready' || sq.status === 'running' ? timeAgo(sq.startedAt) : null
+            const duration = (sq.status === 'completed' || sq.status === 'terminated') ? runDuration(sq.startedAt, sq.finishedAt) : null
+            const lt = sq.lastTermination
+            const restartRecencyMs = lt?.finishedAt ? Date.now() - new Date(lt.finishedAt).getTime() : null
+            const restartColor = restartRecencyMs !== null && restartRecencyMs < 600000 ? 'text-red-400' : restartRecencyMs !== null && restartRecencyMs < 3600000 ? 'text-yellow-400' : 'text-orange-400'
+            const tooltipContent = (
+              <div className="whitespace-normal space-y-1">
+                {/* Header: dot + name + state */}
+                <div className="flex items-center gap-1.5">
+                  <div className={clsx('w-2 h-2 rounded-full shrink-0', dotColor)} />
+                  <span className="font-medium">{sq.isInit ? <span className="text-theme-text-tertiary font-normal">init · </span> : ''}{sq.name}</span>
+                  <span className="text-theme-text-tertiary">·</span>
+                  <span className="text-theme-text-secondary">{stateLabel}</span>
+                </div>
+                {/* Reason (when different from state label) */}
+                {sq.reason && sq.reason !== stateLabel && (
+                  <div className={clsx(
+                    'font-medium',
+                    (sq.status === 'waiting' || sq.status === 'terminated') ? 'text-red-400' : 'text-theme-text-secondary'
+                  )}>{sq.reason}</div>
+                )}
+                {/* Message — truncated for tooltip */}
+                {sq.message && (
+                  <div className="text-theme-text-secondary text-[11px] leading-tight">
+                    {sq.message.length > 120 ? sq.message.slice(0, 120) + '...' : sq.message}
+                  </div>
+                )}
+                {/* Exit code + uptime/duration on same line */}
+                {(sq.exitCode !== undefined && sq.status !== 'ready' && sq.status !== 'running') || uptime || duration ? (
+                  <div className="text-theme-text-tertiary flex items-center gap-1.5">
+                    {sq.exitCode !== undefined && sq.status !== 'ready' && sq.status !== 'running' && (
+                      <span className={sq.exitCode !== 0 ? 'text-red-400' : ''}>exit {sq.exitCode}</span>
+                    )}
+                    {uptime && <span>up {uptime.replace(' ago', '')}</span>}
+                    {duration && <span>ran {duration}</span>}
+                  </div>
+                ) : null}
+                {/* Restarts + last crash info */}
+                {sq.restarts > 0 && (
+                  <div className={clsx('border-t border-theme-border/50 pt-1 space-y-0.5', restartColor)}>
+                    <div className="flex items-center gap-1.5">
+                      <span>{sq.restarts} restart{sq.restarts !== 1 ? 's' : ''}</span>
+                      {lt?.finishedAt && <span className="text-theme-text-tertiary">· last {timeAgo(lt.finishedAt)}</span>}
+                    </div>
+                    {lt?.reason && (
+                      <div className="text-theme-text-tertiary">
+                        {lt.reason}{lt.exitCode !== undefined && lt.exitCode !== 0 ? ` (exit ${lt.exitCode})` : ''}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
             return (
               <React.Fragment key={i}>
                 {showSeparator && <div className="w-px h-3 bg-theme-text-tertiary/40 mx-0.5" />}
-                <Tooltip content={label}>
+                <Tooltip content={tooltipContent} className="whitespace-normal max-w-xs">
                   <div className={clsx('w-2.5 h-2.5 rounded-sm', bgClass, ringClass)} />
                 </Tooltip>
               </React.Fragment>

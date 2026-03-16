@@ -15,12 +15,14 @@ import {
   useRestartWorkload, useWorkloadRevisions, useRollbackWorkload,
   useFluxReconcile, useFluxSyncWithSource, useFluxSuspend, useFluxResume,
   useArgoSync, useArgoRefresh, useArgoSuspend, useArgoResume,
+  useCordonNode, useUncordonNode, useDrainNode,
+  useCascadeDeletePreview,
   fetchJSON,
 } from '../../api/client'
 import { PrometheusCharts, isPrometheusSupported } from '../resource/PrometheusCharts'
 import { WorkloadLogsViewer } from '../logs/WorkloadLogsViewer'
 import { LogsViewer } from '../logs/LogsViewer'
-import { useCanUpdateSecrets, useCanExec, useCanViewLogs, useCanPortForward } from '../../contexts/CapabilitiesContext'
+import { useCanUpdateSecrets, useCanNodeWrite, useNamespacedCapabilities } from '../../contexts/CapabilitiesContext'
 import { useOpenTerminal, useOpenLogs, useOpenWorkloadLogs, useOpenNodeTerminal } from '../dock'
 import { PortForwardButton } from '../portforward/PortForwardButton'
 import { useToast } from '../ui/Toast'
@@ -111,9 +113,7 @@ function useActionsBarProps(kind: string, namespace: string, name: string) {
   const openLogs = useOpenLogs()
   const openWorkloadLogs = useOpenWorkloadLogs()
   const openNodeTerminal = useOpenNodeTerminal()
-  const canExec = useCanExec()
-  const canViewLogs = useCanViewLogs()
-  const canPortForward = useCanPortForward()
+  const { canExec, canViewLogs, canPortForward } = useNamespacedCapabilities(namespace)
 
   const deleteMutation = useDeleteResource()
   const restartWorkloadMutation = useRestartWorkload()
@@ -135,6 +135,13 @@ function useActionsBarProps(kind: string, namespace: string, name: string) {
   const argoSuspendMutation = useArgoSuspend()
   const argoResumeMutation = useArgoResume()
 
+  const { data: cascadePreview, isLoading: cascadeLoading } = useCascadeDeletePreview(kind, namespace, name, true)
+
+  const canNodeWrite = useCanNodeWrite()
+  const cordonMutation = useCordonNode()
+  const uncordonMutation = useUncordonNode()
+  const drainMutation = useDrainNode()
+
   return {
     canExec,
     canViewLogs,
@@ -149,6 +156,8 @@ function useActionsBarProps(kind: string, namespace: string, name: string) {
     ),
     onDelete: (params: any, callbacks?: any) => deleteMutation.mutate(params, { onSuccess: callbacks?.onSuccess }),
     isDeleting: deleteMutation.isPending,
+    cascadeDependents: cascadePreview?.dependents,
+    cascadeLoading,
     onRestart: (params: any) => restartWorkloadMutation.mutate(params),
     isRestarting: restartWorkloadMutation.isPending,
     revisions: revisionsList,
@@ -178,6 +187,13 @@ function useActionsBarProps(kind: string, namespace: string, name: string) {
     isArgoSuspending: argoSuspendMutation.isPending,
     onArgoResume: (params: any) => argoResumeMutation.mutate(params),
     isArgoResuming: argoResumeMutation.isPending,
+    canNodeWrite,
+    onCordonNode: (params: any) => cordonMutation.mutate(params),
+    isCordoningNode: cordonMutation.isPending,
+    onUncordonNode: (params: any) => uncordonMutation.mutate(params),
+    isUncordoningNode: uncordonMutation.isPending,
+    onDrainNode: (params: any) => drainMutation.mutate(params),
+    isDrainingNode: drainMutation.isPending,
   }
 }
 

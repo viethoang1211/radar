@@ -25,11 +25,13 @@ export interface ResourcePermissions {
 // Feature capabilities based on RBAC permissions
 export interface Capabilities {
   exec: boolean           // Terminal feature (pods/exec)
+  localTerminal: boolean  // Local terminal available (not in-cluster, not disabled)
   logs: boolean           // Log viewer (pods/log)
   portForward: boolean    // Port forwarding (pods/portforward)
   secrets: boolean        // List secrets
   secretsUpdate: boolean  // Update secrets (inline editing)
   helmWrite: boolean      // Helm write operations (install, upgrade, rollback, uninstall, apply values)
+  nodeWrite: boolean      // Node write operations (cordon, uncordon, drain)
   mcpEnabled: boolean     // MCP server is running
   resources?: ResourcePermissions // Per-resource-type permissions
 }
@@ -95,6 +97,7 @@ export type CoreNodeKind =
   | 'ServersTransportTCP' // Traefik ServersTransportTCP
   | 'TLSOption'          // Traefik TLSOption
   | 'TLSStore'           // Traefik TLSStore
+  | 'HTTPProxy'          // Contour HTTPProxy
 
 // NodeKind can be a core kind or any arbitrary CRD kind string
 export type NodeKind = CoreNodeKind | (string & {})
